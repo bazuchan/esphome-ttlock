@@ -1,0 +1,64 @@
+# Usual esphome stuff
+substitutions:
+  hostname: ttlock1
+
+esphome:
+  name: $hostname
+
+esp32:
+  board: lolin32_lite
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_pass
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_pass
+
+# TTLock relevant stuff
+time:
+  - platform: sntp
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+lock:
+  - platform: ttlock
+    id: front_door_lock
+    name: "Front Door"
+
+    address: "51:e3:1b:be:80:eb"
+    admin_ps:   !secret fd_admin_ps
+    unlock_key: !secret fd_unlock_key
+    aes_key:    !secret fd_aes_key
+
+    # secrets.yaml format
+    # fd_admin_ps:   0x259eb983
+    # fd_unlock_key: 0x3789ea99
+    # fd_aes_key:    "f557663ecb62567265959a84e6e57135"
+
+    battery_level:
+      name: "Front Door Battery"
+
+    passage_mode:
+      name: "Front Door Passage Mode"
+
+    # Protocol version defaults suit most V3 door locks.
+    # Override only if needed:
+    # protocol_type: 0x05
+    # protocol_version: 0x03
+    # scene: 0x02
+    # group_id: 0x0000
+    # org_id: 0x0000

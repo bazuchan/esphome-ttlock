@@ -1,0 +1,32 @@
+# Usual esphome stuff
+substitutions:
+  hostname: "ble1"
+
+esphome:
+  name: $hostname
+
+esp32:
+  board: lolin32_lite
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_pass
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_pass
+
+# TTLock relevant stuff
+esp32_ble_tracker:
+
+bluetooth_proxy:
+  active: true

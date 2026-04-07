@@ -1,0 +1,2 @@
+aioesphomeapi~=44.8.0
+pycryptodome~=3.23.0
