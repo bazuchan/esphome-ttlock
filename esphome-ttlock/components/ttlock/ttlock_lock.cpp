@@ -276,18 +276,6 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
 }
 
 void TTLockLock::schedule_reconnect_() {
-  bool has_pending = pending_passage_on_ || pending_passage_off_ ||
-                     pending_unlock_     || pending_lock_;
-  // In passage mode with nothing pending, schedule a periodic status check so
-  // we can re-unlock if the lock auto-relocked while passage mode was active.
-  if (passage_mode_ && !has_pending) {
-    ESP_LOGD(TAG, "Passage mode idle, status check in %u ms", PASSAGE_CHECK_MS);
-    this->set_timeout("reconnect", PASSAGE_CHECK_MS, [this]() {
-      if (espbt::ESPBTClient::state() == espbt::ClientState::IDLE)
-        this->connect();
-    });
-    return;
-  }
   // Short delay before reconnect so the lock has time to close its side.
   ESP_LOGD(TAG, "Scheduling reconnect in 500 ms");
   this->set_timeout("reconnect", 500, [this]() {
@@ -357,26 +345,16 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
     case OpState::QUERY_STATUS:
       if (cmd == CMD_GET_STATUS && data.size() >= 4) {
         // data[3] = LockedStatus: 0 = LOCKED, 1 = UNLOCKED (JS SDK convention)
-        bool is_unlocked = (data[3] == 1);
-        op_state_ = OpState::IDLE;
-        if (is_unlocked) {
+        last_status_unlocked_ = (data[3] == 1);
+        if (last_status_unlocked_) {
           ESP_LOGI(TAG, "Lock status: UNLOCKED");
           this->publish_state(lock::LOCK_STATE_UNLOCKED);
-          if (passage_switch_)
-            passage_switch_->publish_state(passage_mode_);
         } else {
           ESP_LOGI(TAG, "Lock status: LOCKED");
           this->publish_state(lock::LOCK_STATE_LOCKED);
-          if (passage_switch_)
-            passage_switch_->publish_state(passage_mode_);
-          // Passage mode is active but the lock auto-relocked – verify passage
-          // mode state on the lock before re-unlocking.
-          if (passage_mode_) {
-            ESP_LOGI(TAG, "Passage mode active but lock is LOCKED – querying passage then re-unlocking");
-            pending_passage_on_ = true;
-            do_check_admin_();
-          }
         }
+        // Always follow with a passage mode query so passage_mode_ stays in sync.
+        do_check_admin_();
       }
       break;
 
@@ -403,10 +381,8 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
     case OpState::CHECK_RANDOM:
       if (cmd == CMD_CHECK_RANDOM) {
         if (pending_passage_on_) {
-          // Query current passage mode first: if empty → ADD directly;
-          // if entries present → already active; if wrong → CLEAR then reconnect.
-          op_state_ = OpState::QUERY_PASSAGE_CMD;
-          do_query_passage_();
+          op_state_ = OpState::PASSAGE_ON_CMD;
+          do_passage_on_();
         } else if (pending_passage_off_) {
           op_state_ = OpState::PASSAGE_OFF_CMD;
           do_passage_off_();
@@ -416,6 +392,8 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         } else if (pending_lock_) {
           op_state_ = OpState::LOCK_CMD;
           do_lock_();
+        } else {
+          do_query_passage_();
         }
       } else {
         ESP_LOGE(TAG, "CHECK_RANDOM failed (cmd=0x%02X status=0x%02X)", cmd, status);
@@ -426,58 +404,48 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
       }
       break;
 
+    // ── Boot sync: read passage schedule from lock ────────────────────────
+
     case OpState::QUERY_PASSAGE_CMD:
-      // Response layout: data[] = [cmd, status, op, seq, type, weekOrDay, month, sH, sM, eH, eM, ...]
-      // One 7-byte entry needs 4 header bytes + 7 = 11 total. TS SDK checks commandData.length >= 10
-      // (commandData omits the leading cmd byte), which translates to data.size() >= 11 here.
       if (cmd == CMD_CONFIGURE_PASSAGE) {
-        if (data.size() >= 11) {
-          // Entries present → passage mode already active in firmware; just unlock.
-          ESP_LOGI(TAG, "Passage mode already active, unlocking");
-          pending_passage_on_ = false;
-          passage_mode_       = true;
-          pending_unlock_     = true;
-          op_state_           = OpState::UNLOCK_CMD;
+        // Response header: [cmd=0x66, status, battery, unknown, seq]  = 5 bytes
+        // Each schedule entry is 7 bytes: [type, weekOrDay, month, startH, startM, endH, endM]
+        // has_entries when total decoded data >= 5 + 7 = 12 bytes
+        bool has_entries = (data.size() >= 12);
+        passage_mode_ = has_entries;
+        if (passage_switch_)
+          passage_switch_->publish_state(passage_mode_);
+        ESP_LOGI(TAG, "Passage mode: %s", passage_mode_ ? "ACTIVE" : "INACTIVE");
+        // Re-unlock if passage mode is active but the lock reported LOCKED.
+        // Actually this should never happen, need to check it on more locks
+        if (passage_mode_ && !last_status_unlocked_) {
+          ESP_LOGI(TAG, "Passage mode active but locked – re-unlocking");
+          pending_unlock_ = true;
+          op_state_       = OpState::UNLOCK_CMD;
           do_unlock_();
         } else {
-          // No entries → safe to ADD directly (either fresh or post-CLEAR session).
-          ESP_LOGD(TAG, "Passage mode not set, adding");
-          op_state_ = OpState::PASSAGE_ON_CMD;
-          do_passage_on_();
+          op_state_ = OpState::IDLE;
         }
-      }
-      break;
-
-    case OpState::PASSAGE_CLEAR_CMD:
-      // CLEAR response (only reached when QUERY found wrong/stale entries).
-      // ADD in the same session as CLEAR always fails (firmware bug), so return to
-      // IDLE; the lock will disconnect naturally (reason 0x13). On the next session
-      // QUERY returns empty → ADD proceeds without another CLEAR.
-      if (cmd == CMD_CONFIGURE_PASSAGE) {
-        ESP_LOGD(TAG, "PASSAGE_CLEAR done, ADD will follow on next connect");
+      } else {
+        ESP_LOGW(TAG, "Unexpected response in QUERY_PASSAGE_CMD (cmd=0x%02X)", cmd);
         op_state_ = OpState::IDLE;
-        // pending_passage_on_ remains true for the reconnect
       }
       break;
 
     case OpState::PASSAGE_ON_CMD:
       if (cmd == CMD_CONFIGURE_PASSAGE) {
+        pending_passage_on_ = false;
+        passage_mode_       = true;
         if (status == 0x01) {
-          pending_passage_on_ = false;
-          passage_mode_       = true;
-          ESP_LOGI(TAG, "Passage mode enabled in firmware, unlocking");
-          pending_unlock_ = true;
-          op_state_       = OpState::UNLOCK_CMD;
-          do_unlock_();
+          ESP_LOGI(TAG, "Passage mode ADD acknowledged, unlocking");
         } else {
-          // ADD failed — reset and retry from scratch next time.
-          ESP_LOGE(TAG, "Passage mode ADD failed (status=0x%02X), will retry", status);
-          pending_passage_on_ = false;
-          passage_mode_       = false;
-          op_state_           = OpState::IDLE;
-          if (passage_switch_) passage_switch_->publish_state(false);
-          this->publish_state(lock::LOCK_STATE_LOCKED);
+          // Lock did not confirm ADD but we still track passage mode in memory
+          // and proceed to unlock; the lock will be re-unlocked on every reconnect.
+          ESP_LOGW(TAG, "Passage mode ADD status=0x%02X (proceeding anyway)", status);
         }
+        pending_unlock_ = true;
+        op_state_       = OpState::UNLOCK_CMD;
+        do_unlock_();
       }
       break;
 
@@ -569,8 +537,8 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           if (passage_switch_)
             passage_switch_->publish_state(passage_mode_);
           if (passage_mode_) {
-            ESP_LOGI(TAG, "Passage mode active, querying passage then re-unlocking after unsolicited lock");
-            pending_passage_on_ = true;
+            ESP_LOGI(TAG, "Passage mode active, re-unlocking after unsolicited lock");
+            pending_unlock_ = true;
             do_check_admin_();
           }
         }
@@ -588,7 +556,6 @@ void TTLockLock::start_pending_() {
   if (pending_passage_on_ || pending_passage_off_ || pending_unlock_ || pending_lock_) {
     do_check_admin_();
   } else {
-    // No pending operation – query the physical lock state so HA stays in sync.
     do_query_status_();
   }
 }
@@ -661,9 +628,9 @@ void TTLockLock::do_lock_() {
 }
 
 void TTLockLock::do_query_passage_() {
-  // COMM_CONFIGURE_PASSAGE_MODE QUERY (op=0x01, type=Weekly).
-  // Response payload: empty → not configured; 7 bytes/entry → active entries.
-  static const uint8_t payload[] = {0x01, 0x01};  // QUERY, Week type
+  // 0x66 QUERY: op=1, seq=0 (request first page of schedule entries)
+  static const uint8_t payload[] = {0x01, 0x00};
+  op_state_ = OpState::QUERY_PASSAGE_CMD;
   ESP_LOGD(TAG, "→ QUERY_PASSAGE");
   send_cmd_(CMD_CONFIGURE_PASSAGE, payload, sizeof(payload));
 }
@@ -679,15 +646,17 @@ void TTLockLock::do_passage_clear_() {
 void TTLockLock::do_passage_on_() {
   // COMM_CONFIGURE_PASSAGE_MODE ADD: all-day, every day (weekly).
   // Called after PASSAGE_CLEAR_CMD completes (CLEAR→ADD sequence is idempotent).
-  // Payload: [op=ADD(2), type=WEEKLY(1), weekOrDay=0, month=0, startH=0, startM=0, endH=0, endM=0]
-  static const uint8_t payload[] = {0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  // Payload: [op=ADD(2), type=WEEKLY(1), seq=0, weekOrDay=0x7f(all dayes), startH=0, startM=0, endH=23, endM=59]
+  static const uint8_t payload[] = {0x02, 0x01, 0x00, 0x7F, 0x00, 0x00, 0x17, 0x3B};
+  op_state_ = OpState::PASSAGE_ON_CMD;
   ESP_LOGD(TAG, "→ PASSAGE_ON (add)");
   send_cmd_(CMD_CONFIGURE_PASSAGE, payload, sizeof(payload));
 }
 
 void TTLockLock::do_passage_off_() {
-  // COMM_CONFIGURE_PASSAGE_MODE CLEAR: remove all passage mode entries, then lock.
+  // Send 0x66 CLEAR then LOCK. passage_mode_ will be cleared in PASSAGE_OFF_CMD handler.
   op_state_ = OpState::PASSAGE_OFF_CMD;
+  ESP_LOGD(TAG, "→ PASSAGE_CLEAR (off)");
   do_passage_clear_();
 }
 
@@ -700,17 +669,15 @@ void TTLockPassageSwitch::write_state(bool state) {
 
 void TTLockLock::set_passage_mode(bool enable) {
   ESP_LOGI(TAG, "Passage mode %s", enable ? "ON" : "OFF");
+  // User is explicitly commanding passage mode – no need for boot sync on next reconnect.
+  passage_mode_        = enable;
+  pending_passage_on_  = enable;
+  pending_passage_off_ = !enable;
+  pending_unlock_      = false;
+  pending_lock_        = false;
   if (enable) {
-    pending_passage_on_  = true;
-    pending_passage_off_ = false;
-    pending_unlock_      = false;
-    pending_lock_        = false;
     this->publish_state(lock::LOCK_STATE_UNLOCKING);
   } else {
-    pending_passage_off_ = true;
-    pending_passage_on_  = false;
-    pending_unlock_      = false;
-    pending_lock_        = false;
     this->publish_state(lock::LOCK_STATE_LOCKING);
   }
   auto ble_st = espbt::ESPBTClient::state();

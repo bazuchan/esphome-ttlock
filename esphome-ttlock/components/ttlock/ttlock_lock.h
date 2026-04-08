@@ -28,7 +28,6 @@ static constexpr uint16_t NOTIFY_UUID   = 0xFFF4;  // Lock → App
 static constexpr uint16_t MTU_SIZE = 20;  // max bytes per BLE write chunk
 
 // ── Passage mode status-check interval ─────────────────────────────────────
-static constexpr uint32_t PASSAGE_CHECK_MS = 30000;  // 30 s between status polls
 
 // ── Packet layout (proto_type >= 5 / V3) ───────────────────────────────────
 // [0x7F][0x5A][proto_type][proto_ver][scene][group_hi][group_lo][org_hi][org_lo]
@@ -131,13 +130,14 @@ class TTLockLock : public lock::Lock,
   LockVersion lv_;
 
   // ── Operation state ────────────────────────────────────────────────────
-  OpState  op_state_           {OpState::IDLE};
-  bool     pending_unlock_     {false};
-  bool     pending_lock_       {false};
-  bool     pending_passage_on_ {false};  // enable passage mode via 0x66
-  bool     pending_passage_off_{false};  // disable passage mode via 0x66
-  bool     passage_mode_       {false};  // true while lock firmware has passage mode active
-  uint32_t ps_from_lock_       {0};
+  OpState  op_state_              {OpState::IDLE};
+  bool     pending_unlock_        {false};
+  bool     pending_lock_          {false};
+  bool     pending_passage_on_    {false};  // enable passage mode via 0x66
+  bool     pending_passage_off_   {false};  // disable passage mode via 0x66
+  bool     passage_mode_          {false};
+  bool     last_status_unlocked_  {false};  // result of last QUERY_STATUS, used by QUERY_PASSAGE_CMD
+  uint32_t ps_from_lock_          {0};
 
   // ── RX buffer (reassembly across MTU chunks) ───────────────────────────
   std::vector<uint8_t> rx_buf_;
@@ -168,8 +168,8 @@ class TTLockLock : public lock::Lock,
   void do_query_status_();
   void do_check_admin_();
   void do_check_random_();
-  void do_query_passage_();  // QUERY step: determines ADD vs CLEAR+reconnect+ADD
-  void do_passage_clear_();  // CLEAR step (used by both ON and OFF flows)
+  void do_query_passage_();
+  void do_passage_clear_();
   void do_passage_on_();
   void do_passage_off_();
   void do_unlock_();
