@@ -64,4 +64,5 @@ lock:
     # org_id: 0x0000
 
     # Status polling can be disabled by setting the "polling" variable to false (default: true)
+    # Manual status update can be made by calling id(your_lock)->request_update()
     # polling: true
