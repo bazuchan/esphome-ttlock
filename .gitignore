@@ -1,3 +1,5 @@
 **/__pycache__/
 **/ve/
 **/locks.json
+**/run.sh
+grab-locks-from-app/*.db
