@@ -100,9 +100,14 @@ class TTLockLock : public lock::Lock,
   void set_org_id(uint16_t v)     { lv_.org_id     = v; }
   void set_battery_sensor(sensor::Sensor *s) { battery_sensor_ = s; }
   void set_passage_switch(TTLockPassageSwitch *s) { passage_switch_ = s; }
+  void set_polling(bool v) { polling_ = v; }
 
   // Called by TTLockPassageSwitch
   void set_passage_mode(bool enable);
+
+  // Request a one-shot status + passage mode update. Safe to call from a lambda.
+  // Connects if needed; in polling=false mode this is the only way to refresh state.
+  void request_update();
 
  protected:
   // ── State machine ──────────────────────────────────────────────────────
@@ -135,8 +140,11 @@ class TTLockLock : public lock::Lock,
   bool     pending_lock_          {false};
   bool     pending_passage_on_    {false};  // enable passage mode via 0x66
   bool     pending_passage_off_   {false};  // disable passage mode via 0x66
+  bool     polling_               {true};   // reconnect continuously; false = on-demand only
   bool     passage_mode_          {false};
   bool     last_status_unlocked_  {false};  // result of last QUERY_STATUS, used by QUERY_PASSAGE_CMD
+  bool     pending_status_query_  {false};  // one-shot reconnect for status update (polling=false)
+  bool     auto_unlock_           {false};  // re-unlock triggered by passage mode, not user
   uint32_t ps_from_lock_          {0};
 
   // ── RX buffer (reassembly across MTU chunks) ───────────────────────────

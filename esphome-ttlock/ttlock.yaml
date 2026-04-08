@@ -62,3 +62,6 @@ lock:
     # scene: 0x02
     # group_id: 0x0000
     # org_id: 0x0000
+
+    # Status polling can be disabled by setting the "polling" variable to false (default: true)
+    # polling: true

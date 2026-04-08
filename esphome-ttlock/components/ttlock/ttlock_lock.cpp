@@ -261,6 +261,7 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       write_handle_  = 0;
       notify_handle_ = 0;
       op_state_      = OpState::IDLE;
+      auto_unlock_   = false;
       rx_buf_.clear();
       break;
 
@@ -276,14 +277,20 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
 }
 
 void TTLockLock::schedule_reconnect_() {
+  if (!polling_) {
+    bool has_work = pending_unlock_ || pending_lock_ ||
+                    pending_passage_on_ || pending_passage_off_ ||
+                    pending_status_query_;
+    if (!has_work) {
+      ESP_LOGD(TAG, "Polling disabled, no pending work – not reconnecting");
+      return;
+    }
+  }
   // Short delay before reconnect so the lock has time to close its side.
   ESP_LOGD(TAG, "Scheduling reconnect in 500 ms");
   this->set_timeout("reconnect", 500, [this]() {
     auto st = espbt::ESPBTClient::state();
     ESP_LOGD(TAG, "Reconnect timeout fired, state=%d", (int) st);
-    // Only connect from IDLE — calling connect() while DISCONNECTING causes the
-    // ESP-IDF stack to queue esp_ble_gattc_open(), which bounces back as
-    // ESP_GATTC_OPEN_EVT status=133 in DISCONNECTING state.
     if (st == espbt::ClientState::IDLE)
       this->connect();
   });
@@ -404,8 +411,6 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
       }
       break;
 
-    // ── Boot sync: read passage schedule from lock ────────────────────────
-
     case OpState::QUERY_PASSAGE_CMD:
       if (cmd == CMD_CONFIGURE_PASSAGE) {
         // Response header: [cmd=0x66, status, battery, unknown, seq]  = 5 bytes
@@ -420,6 +425,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         // Actually this should never happen, need to check it on more locks
         if (passage_mode_ && !last_status_unlocked_) {
           ESP_LOGI(TAG, "Passage mode active but locked – re-unlocking");
+          auto_unlock_    = true;  // marks this as automatic, not user-initiated
           pending_unlock_ = true;
           op_state_       = OpState::UNLOCK_CMD;
           do_unlock_();
@@ -475,6 +481,9 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         op_state_ = OpState::IDLE;
         if (status == 0x01) {
           pending_unlock_ = false;
+          if (!polling_ && !auto_unlock_)
+            pending_status_query_ = true;  // schedule one status+passage query after disconnect
+          auto_unlock_ = false;
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
@@ -502,6 +511,8 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         if (status == 0x01) {
           pending_lock_ = false;
           passage_mode_ = false;  // locking always exits passage mode
+          if (!polling_)
+            pending_status_query_ = true;  // schedule one status+passage query after disconnect
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
@@ -556,6 +567,7 @@ void TTLockLock::start_pending_() {
   if (pending_passage_on_ || pending_passage_off_ || pending_unlock_ || pending_lock_) {
     do_check_admin_();
   } else {
+    pending_status_query_ = false;  // consuming this request
     do_query_status_();
   }
 }
@@ -667,10 +679,18 @@ void TTLockPassageSwitch::write_state(bool state) {
   lock_->set_passage_mode(state);
 }
 
+void TTLockLock::request_update() {
+  pending_status_query_ = true;
+  auto ble_st = espbt::ESPBTClient::state();
+  if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
+    start_pending_();
+  else if (ble_st == espbt::ClientState::IDLE)
+    this->connect();
+}
+
 void TTLockLock::set_passage_mode(bool enable) {
   ESP_LOGI(TAG, "Passage mode %s", enable ? "ON" : "OFF");
-  // User is explicitly commanding passage mode – no need for boot sync on next reconnect.
-  passage_mode_        = enable;
+  passage_mode_ = enable;
   pending_passage_on_  = enable;
   pending_passage_off_ = !enable;
   pending_unlock_      = false;
