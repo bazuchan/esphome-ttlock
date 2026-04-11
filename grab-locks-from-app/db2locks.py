@@ -107,7 +107,8 @@ for row in rows:
 conn.close()
 
 if needwrite:
-    shutil.copy(locks_file, f'{locks_file}.bak')
+    if os.path.exists(locks_file):
+        shutil.copy(locks_file, f'{locks_file}.bak')
     json.dump(locks, open(locks_file, 'w'), indent=4)
     print(f'{locks_file} updated')
 
