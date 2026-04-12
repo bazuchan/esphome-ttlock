@@ -221,7 +221,6 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       write_handle_  = chr_write->handle;
       notify_handle_ = chr_notify->handle;
       ESP_LOGD(TAG, "Handles write=0x%04X notify=0x%04X", write_handle_, notify_handle_);
-      // Register for notifications on FFF4; base will write CCCD descriptor.
       esp_err_t err = esp_ble_gattc_register_for_notify(
           this->get_gattc_if(), this->get_remote_bda(), notify_handle_);
       if (err != ESP_OK)
@@ -246,54 +245,21 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
         on_ble_data_(param->notify.value, param->notify.value_len);
       break;
 
-    // ── Connection failed: OPEN_EVT with error status ────────────────────────
-    // Base already called set_idle_(); CLOSE_EVT will NOT follow in this case.
-    case ESP_GATTC_OPEN_EVT:
-      if (param->open.status != ESP_GATT_OK && param->open.status != ESP_GATT_ALREADY_OPEN)
-        schedule_reconnect_();
-      break;
-
-    // ── Disconnected: reset protocol state; wait for CLOSE_EVT to reconnect ──
+    // ── Disconnected: reset protocol state ───────────────────────────────────
+    // Do NOT publish UNKNOWN – keep the last known state (LOCKED/UNLOCKED).
+    // The lock disconnects after each operation; showing UNKNOWN on every
+    // disconnect causes confusing state flicker in HA.
     case ESP_GATTC_DISCONNECT_EVT:
-      // Do NOT publish UNKNOWN – keep the last known state (LOCKED/UNLOCKED).
-      // The lock disconnects after each operation; showing UNKNOWN on every
-      // disconnect causes confusing state flicker in HA.
       write_handle_  = 0;
       notify_handle_ = 0;
       op_state_      = OpState::IDLE;
-      auto_unlock_   = false;
       rx_buf_.clear();
-      break;
-
-    // ── Connection fully closed: schedule fast reconnect ────────────────────
-    case ESP_GATTC_CLOSE_EVT:
-      schedule_reconnect_();
       break;
 
     default:
       break;
   }
   return true;
-}
-
-void TTLockLock::schedule_reconnect_() {
-  if (!polling_) {
-    bool has_work = pending_unlock_ || pending_lock_ ||
-                    pending_passage_on_ || pending_passage_off_ ||
-                    pending_status_query_;
-    if (!has_work) {
-      ESP_LOGD(TAG, "Polling disabled, no pending work – not reconnecting");
-      return;
-    }
-  }
-  // Short delay before reconnect so the lock has time to close its side.
-  ESP_LOGD(TAG, "Scheduling reconnect in 500 ms");
-  this->set_timeout("reconnect", 500, [this]() {
-    auto st = espbt::ESPBTClient::state();
-    ESP_LOGD(TAG, "Reconnect timeout fired, state=%d", (int) st);
-    if (st == espbt::ClientState::IDLE)
-      this->connect();
-  });
 }
 
 // ── Data reception  (reassemble MTU chunks → complete frame) ─────────────────
@@ -425,7 +391,6 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         // Actually this should never happen, need to check it on more locks
         if (passage_mode_ && !last_status_unlocked_) {
           ESP_LOGI(TAG, "Passage mode active but locked – re-unlocking");
-          auto_unlock_    = true;  // marks this as automatic, not user-initiated
           pending_unlock_ = true;
           op_state_       = OpState::UNLOCK_CMD;
           do_unlock_();
@@ -481,9 +446,6 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         op_state_ = OpState::IDLE;
         if (status == 0x01) {
           pending_unlock_ = false;
-          if (!polling_ && !auto_unlock_)
-            pending_status_query_ = true;  // schedule one status+passage query after disconnect
-          auto_unlock_ = false;
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
@@ -511,8 +473,6 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         if (status == 0x01) {
           pending_lock_ = false;
           passage_mode_ = false;  // locking always exits passage mode
-          if (!polling_)
-            pending_status_query_ = true;  // schedule one status+passage query after disconnect
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
@@ -567,7 +527,6 @@ void TTLockLock::start_pending_() {
   if (pending_passage_on_ || pending_passage_off_ || pending_unlock_ || pending_lock_) {
     do_check_admin_();
   } else {
-    pending_status_query_ = false;  // consuming this request
     do_query_status_();
   }
 }
@@ -680,7 +639,6 @@ void TTLockPassageSwitch::write_state(bool state) {
 }
 
 void TTLockLock::request_update() {
-  pending_status_query_ = true;
   auto ble_st = espbt::ESPBTClient::state();
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
     start_pending_();
@@ -719,7 +677,6 @@ void TTLockLock::control(const lock::LockCall &call) {
     pending_passage_on_  = false;
     pending_passage_off_ = false;
     this->publish_state(lock::LOCK_STATE_UNLOCKING);
-    ESP_LOGD(TAG, "Unlock queued, BLE state=%d", (int) espbt::ESPBTClient::state());
     {
       auto ble_st = espbt::ESPBTClient::state();
       if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
@@ -730,7 +687,6 @@ void TTLockLock::control(const lock::LockCall &call) {
 
   } else if (*state == lock::LOCK_STATE_LOCKED) {
     if (passage_mode_) {
-      // Must clear passage mode in firmware before locking.
       set_passage_mode(false);
     } else {
       pending_lock_        = true;
@@ -755,10 +711,58 @@ void TTLockLock::setup() {
   ble_client::BLEClientBase::setup();
   this->publish_state(lock::LOCK_STATE_NONE);
   ESP_LOGI(TAG, "TTLock setup: app_id=%d addr=%s", this->app_id, this->address_str());
+  esp32_ble_tracker::global_esp32_ble_tracker->register_listener(this);
 }
 
-void TTLockLock::loop() {
-  ble_client::BLEClientBase::loop();
+// ── Advertisement parser ─────────────────────────────────────────────────────
+//   V3 (proto=5, ver=3) manufacturer data layout in raw AD payload:
+//     [proto_type][proto_ver][scene][params][battery][...]
+//   ESPHome strips the 2-byte company ID ([proto_type][proto_ver]) into the UUID,
+//   so in mfr.data: [0]=scene  [1]=params  [2]=battery
+//   Non-V3: params at raw[8] = mfr.data[6]
+//
+// params bits: 0=UNLOCKED, 1=new-events, 2=setting-mode, 3=touch
+
+bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
+  // Only handle our lock
+  if (device.address_str() != this->address_str())
+    return false;
+
+  for (const auto &mfr : device.get_manufacturer_datas()) {
+    uint8_t params = 0xFF;
+    uint8_t battery = 0xFF;
+
+    if (lv_.proto_type == 5 && lv_.proto_ver == 3) {
+      if (mfr.data.size() < 2) continue;
+      params  = mfr.data[1];
+      if (mfr.data.size() >= 3) battery = mfr.data[2];
+    } else {
+      if (mfr.data.size() < 7) continue;
+      params = mfr.data[6];
+    }
+
+    // Suppress duplicate advertisements
+    if (params == last_adv_params_)
+      return false;
+    last_adv_params_ = params;
+
+    bool is_unlocked = (params & 0x01) != 0;
+    ESP_LOGI(TAG, "ADV params=0x%02X -> %s", params, is_unlocked ? "UNLOCKED" : "LOCKED");
+
+    // Don't overwrite state mid-operation (GATTC sequence is authoritative)
+    if (op_state_ == OpState::IDLE) {
+      this->publish_state(is_unlocked ? lock::LOCK_STATE_UNLOCKED : lock::LOCK_STATE_LOCKED);
+    }
+
+    if (battery != 0xFF && battery_sensor_)
+      battery_sensor_->publish_state((float) battery);
+
+    // Params changed → connect to get fresh status + passage query.
+    // set_enabled(true) re-arms the BLEClient so it will connect on the next
+    // advertisement (or immediately if already in range).
+    return true;
+  }
+  return false;
 }
 
 void TTLockLock::dump_config() {

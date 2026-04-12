@@ -35,7 +35,6 @@ CONF_GROUP_ID    = "group_id"
 CONF_ORG_ID      = "org_id"
 CONF_BATTERY     = "battery_level"
 CONF_PASSAGE     = "passage_mode"
-CONF_POLLING     = "polling"
 
 
 def _validate_aes_key(value):
@@ -70,9 +69,6 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_GROUP_ID,   default=0x0000): cv.uint16_t,
             cv.Optional(CONF_ORG_ID,     default=0x0000): cv.uint16_t,
 
-            # ── Polling ───────────────────────────────────────────────────────
-            cv.Optional(CONF_POLLING, default=True): cv.boolean,
-
             # ── Optional sensors / switches ───────────────────────────────────
             cv.Optional(CONF_BATTERY): sensor.sensor_schema(
                 unit_of_measurement=UNIT_PERCENT,
@@ -103,7 +99,6 @@ async def to_code(config):
     cg.add(var.set_unlock_key(config[CONF_UNLOCK_KEY]))
     cg.add(var.set_aes_key(list(bytes.fromhex(config[CONF_AES_KEY]))))
 
-    cg.add(var.set_polling(config[CONF_POLLING]))
     cg.add(var.set_proto_type(config[CONF_PROTO_TYPE]))
     cg.add(var.set_proto_ver(config[CONF_PROTO_VER]))
     cg.add(var.set_scene(config[CONF_SCENE]))

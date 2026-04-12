@@ -28,6 +28,12 @@ ota:
 # TTLock relevant stuff
 time:
   - platform: sntp
+# If you are experiencing incorrect status updates, you can sync it manually, for example, every 5 minutes:
+#     on_time:
+#       minutes: /5
+#       seconds: 0
+#       then:
+#          - lambda: id(front_door_lock).request_update();
 
 external_components:
   - source:
@@ -39,12 +45,13 @@ lock:
     id: front_door_lock
     name: "Front Door"
 
-    address: "51:e3:1b:be:80:eb"
+    address:    !secret fd_address
     admin_ps:   !secret fd_admin_ps
     unlock_key: !secret fd_unlock_key
     aes_key:    !secret fd_aes_key
 
     # secrets.yaml format
+    # fd_address:    "51:e3:1b:be:80:eb"
     # fd_admin_ps:   0x259eb983
     # fd_unlock_key: 0x3789ea99
     # fd_aes_key:    "f557663ecb62567265959a84e6e57135"
@@ -62,7 +69,3 @@ lock:
     # scene: 0x02
     # group_id: 0x0000
     # org_id: 0x0000
-
-    # Status polling can be disabled by setting the "polling" variable to false (default: true)
-    # Manual status update can be made by calling id(your_lock)->request_update()
-    # polling: true

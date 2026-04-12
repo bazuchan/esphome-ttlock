@@ -27,8 +27,6 @@ static constexpr uint16_t NOTIFY_UUID   = 0xFFF4;  // Lock → App
 // ── Transport constants ─────────────────────────────────────────────────────
 static constexpr uint16_t MTU_SIZE = 20;  // max bytes per BLE write chunk
 
-// ── Passage mode status-check interval ─────────────────────────────────────
-
 // ── Packet layout (proto_type >= 5 / V3) ───────────────────────────────────
 // [0x7F][0x5A][proto_type][proto_ver][scene][group_hi][group_lo][org_hi][org_lo]
 // [cmd][0xAA][enc_len][enc_data…][crc8] ++ [0x0D][0x0A]
@@ -40,9 +38,9 @@ static constexpr uint8_t PKT_CRLF1    = 0x0A;
 static constexpr size_t  PKT_OVERHEAD  = 13;  // header through enc_len field + CRC
 
 // ── Command types ───────────────────────────────────────────────────────────
-static constexpr uint8_t CMD_GET_STATUS    = 0x14;  // query current locked state
-static constexpr uint8_t CMD_CHECK_ADMIN   = 0x41;  // 'A'
-static constexpr uint8_t CMD_CHECK_RANDOM  = 0x30;
+static constexpr uint8_t CMD_GET_STATUS          = 0x14;  // query current locked state
+static constexpr uint8_t CMD_CHECK_ADMIN         = 0x41;  // 'A'
+static constexpr uint8_t CMD_CHECK_RANDOM        = 0x30;
 static constexpr uint8_t CMD_UNLOCK              = 0x47;  // COMM_UNLOCK
 static constexpr uint8_t CMD_LOCK                = 0x58;  // COMM_FUNCTION_LOCK
 static constexpr uint8_t CMD_CONFIGURE_PASSAGE   = 0x66;  // COMM_CONFIGURE_PASSAGE_MODE
@@ -75,7 +73,6 @@ class TTLockLock : public lock::Lock,
  public:
   // ── ESPHome Component ──────────────────────────────────────────────────
   void setup() override;
-  void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
@@ -83,6 +80,9 @@ class TTLockLock : public lock::Lock,
   bool gattc_event_handler(esp_gattc_cb_event_t event,
                            esp_gatt_if_t        gattc_if,
                            esp_ble_gattc_cb_param_t *param) override;
+
+  // ── ESPBTDeviceListener ────────────────────────────────────────────────
+  bool parse_device(const espbt::ESPBTDevice &device) override;
 
   // ── lock::Lock ─────────────────────────────────────────────────────────
   void control(const lock::LockCall &call) override;
@@ -100,24 +100,22 @@ class TTLockLock : public lock::Lock,
   void set_org_id(uint16_t v)     { lv_.org_id     = v; }
   void set_battery_sensor(sensor::Sensor *s) { battery_sensor_ = s; }
   void set_passage_switch(TTLockPassageSwitch *s) { passage_switch_ = s; }
-  void set_polling(bool v) { polling_ = v; }
 
   // Called by TTLockPassageSwitch
   void set_passage_mode(bool enable);
 
-  // Request a one-shot status + passage mode update. Safe to call from a lambda.
-  // Connects if needed; in polling=false mode this is the only way to refresh state.
+  // Trigger a status + passage mode update. Safe to call from a lambda.
   void request_update();
 
  protected:
   // ── State machine ──────────────────────────────────────────────────────
   enum class OpState : uint8_t {
     IDLE,
-    QUERY_STATUS,        // querying lock state on idle reconnect
+    QUERY_STATUS,        // querying lock state on connect
     CHECK_ADMIN,
     CHECK_RANDOM,
-    QUERY_PASSAGE_CMD,   // 0x66 QUERY → decide ADD or CLEAR+reconnect+ADD
-    PASSAGE_CLEAR_CMD,   // 0x66 CLEAR → disconnect → reconnect → QUERY → ADD
+    QUERY_PASSAGE_CMD,   // 0x66 QUERY → read passage mode from lock
+    PASSAGE_CLEAR_CMD,   // 0x66 CLEAR
     PASSAGE_ON_CMD,      // 0x66 ADD all-day schedule → then UNLOCK
     PASSAGE_OFF_CMD,     // 0x66 CLEAR → then LOCK
     UNLOCK_CMD,
@@ -135,17 +133,15 @@ class TTLockLock : public lock::Lock,
   LockVersion lv_;
 
   // ── Operation state ────────────────────────────────────────────────────
-  OpState  op_state_              {OpState::IDLE};
-  bool     pending_unlock_        {false};
-  bool     pending_lock_          {false};
-  bool     pending_passage_on_    {false};  // enable passage mode via 0x66
-  bool     pending_passage_off_   {false};  // disable passage mode via 0x66
-  bool     polling_               {true};   // reconnect continuously; false = on-demand only
-  bool     passage_mode_          {false};
-  bool     last_status_unlocked_  {false};  // result of last QUERY_STATUS, used by QUERY_PASSAGE_CMD
-  bool     pending_status_query_  {false};  // one-shot reconnect for status update (polling=false)
-  bool     auto_unlock_           {false};  // re-unlock triggered by passage mode, not user
-  uint32_t ps_from_lock_          {0};
+  OpState  op_state_             {OpState::IDLE};
+  bool     pending_unlock_       {false};
+  bool     pending_lock_         {false};
+  bool     pending_passage_on_   {false};
+  bool     pending_passage_off_  {false};
+  bool     passage_mode_         {false};
+  bool     last_status_unlocked_ {false};
+  uint8_t  last_adv_params_      {0xFF};  // cached advertisement params; 0xFF = never seen
+  uint32_t ps_from_lock_         {0};
 
   // ── RX buffer (reassembly across MTU chunks) ───────────────────────────
   std::vector<uint8_t> rx_buf_;
@@ -153,9 +149,6 @@ class TTLockLock : public lock::Lock,
   // ── Optional sensors / switches ────────────────────────────────────────
   sensor::Sensor       *battery_sensor_{nullptr};
   TTLockPassageSwitch  *passage_switch_{nullptr};
-
-  // ── BLE helpers ────────────────────────────────────────────────────────
-  void schedule_reconnect_();
 
   // ── Protocol helpers ───────────────────────────────────────────────────
   static uint8_t crc8_(const uint8_t *data, size_t len);
