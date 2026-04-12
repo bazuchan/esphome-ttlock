@@ -377,12 +377,11 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         } else if (pending_passage_off_) {
           op_state_ = OpState::PASSAGE_OFF_CMD;
           do_passage_off_();
-        } else if (pending_unlock_) {
-          op_state_ = OpState::UNLOCK_CMD;
-          do_unlock_();
-        } else if (pending_lock_) {
-          op_state_ = OpState::LOCK_CMD;
-          do_lock_();
+        } else if (pending_unlock_ || pending_lock_) {
+          // Always get a fresh ps_from_lock from CHECK_USER_TIME before
+          // UNLOCK/LOCK — some lock models return a different token from
+          // the one supplied by CHECK_ADMIN and validate against it in UNLOCK.
+          do_check_user_time_();
         } else {
           do_query_passage_();
         }
@@ -392,6 +391,38 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         pending_unlock_      = pending_lock_ = false;
         pending_passage_on_  = pending_passage_off_ = false;
         this->publish_state(lock::LOCK_STATE_JAMMED);
+      }
+      break;
+
+    case OpState::CHECK_USER_TIME_CMD:
+      if (cmd == CMD_CHECK_USER_TIME && status == 0x01 && data.size() >= 6) {
+        // Fresh ps_from_lock for the UNLOCK/LOCK sum — different from the one
+        // returned by CHECK_ADMIN on some lock models.
+        ps_from_lock_ = ((uint32_t) data[2] << 24) | ((uint32_t) data[3] << 16) |
+                        ((uint32_t) data[4] <<  8) |  (uint32_t) data[5];
+        ESP_LOGD(TAG, "CHECK_USER_TIME: ps_from_lock=0x%08X", (unsigned) ps_from_lock_);
+        if (pending_unlock_) {
+          op_state_ = OpState::UNLOCK_CMD;
+          do_unlock_();
+        } else if (pending_lock_) {
+          op_state_ = OpState::LOCK_CMD;
+          do_lock_();
+        } else {
+          op_state_ = OpState::IDLE;
+        }
+      } else {
+        ESP_LOGE(TAG, "CHECK_USER_TIME failed (cmd=0x%02X status=0x%02X len=%d)",
+                 cmd, status, data.size());
+        // Fall back: proceed with existing ps_from_lock from CHECK_ADMIN
+        if (pending_unlock_) {
+          op_state_ = OpState::UNLOCK_CMD;
+          do_unlock_();
+        } else if (pending_lock_) {
+          op_state_ = OpState::LOCK_CMD;
+          do_lock_();
+        } else {
+          op_state_ = OpState::IDLE;
+        }
       }
       break;
 
@@ -406,12 +437,10 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           passage_switch_->publish_state(passage_mode_);
         ESP_LOGI(TAG, "Passage mode: %s", passage_mode_ ? "ACTIVE" : "INACTIVE");
         // Re-unlock if passage mode is active but the lock reported LOCKED.
-        // Actually this should never happen, need to check it on more locks
         if (passage_mode_ && !last_status_unlocked_) {
           ESP_LOGI(TAG, "Passage mode active but locked – re-unlocking");
           pending_unlock_ = true;
-          op_state_       = OpState::UNLOCK_CMD;
-          do_unlock_();
+          do_check_user_time_();
         } else {
           op_state_ = OpState::IDLE;
         }
@@ -428,13 +457,10 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         if (status == 0x01) {
           ESP_LOGI(TAG, "Passage mode ADD acknowledged, unlocking");
         } else {
-          // Lock did not confirm ADD but we still track passage mode in memory
-          // and proceed to unlock; the lock will be re-unlocked on every reconnect.
           ESP_LOGW(TAG, "Passage mode ADD status=0x%02X (proceeding anyway)", status);
         }
         pending_unlock_ = true;
-        op_state_       = OpState::UNLOCK_CMD;
-        do_unlock_();
+        do_check_user_time_();
       }
       break;
 
@@ -443,13 +469,9 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         if (status == 0x01) {
           pending_passage_off_ = false;
           passage_mode_        = false;
-          // Passage mode cleared; now explicitly lock the door.
-          // Set op_state_ = LOCK_CMD BEFORE calling do_lock_() so the
-          // LOCK response is processed by the correct handler.
           ESP_LOGI(TAG, "Passage mode cleared, locking");
           pending_lock_ = true;
-          op_state_     = OpState::LOCK_CMD;
-          do_lock_();
+          do_check_user_time_();
         } else {
           ESP_LOGE(TAG, "Passage mode disable failed (status=0x%02X)", status);
           pending_passage_off_ = false;
@@ -601,6 +623,21 @@ void TTLockLock::do_check_random_() {
   data[3] =  sum        & 0xFF;
   ESP_LOGD(TAG, "→ CHECK_RANDOM");
   send_cmd_(CMD_CHECK_RANDOM, data, sizeof(data));
+}
+
+void TTLockLock::do_check_user_time_() {
+  // 17-byte payload — mirrors commands.py build_check_user_time().
+  // Wide-open date range [Jan-31-2000 … Nov-30-2099] with uid=lockFlagPos=0.
+  // The lock returns a fresh ps_from_lock that must be used in the UNLOCK/LOCK sum.
+  static const uint8_t payload[] = {
+    0x00, 0x01, 0x1F, 0x0E, 0x00,  // start: Jan-31-2000 14:00
+    0x63, 0x0B, 0x1E, 0x0E, 0x00,  // end:   Nov-30-2099 14:00 (overwrites lockFlagPos[0])
+    0x00, 0x00, 0x00,               // lockFlagPos[1..3] = 0
+    0x00, 0x00, 0x00, 0x00,         // uid = 0
+  };
+  op_state_ = OpState::CHECK_USER_TIME_CMD;
+  ESP_LOGD(TAG, "→ CHECK_USER_TIME");
+  send_cmd_(CMD_CHECK_USER_TIME, payload, sizeof(payload));
 }
 
 void TTLockLock::do_unlock_() {

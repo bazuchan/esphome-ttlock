@@ -41,6 +41,7 @@ static constexpr size_t  PKT_OVERHEAD  = 13;  // header through enc_len field + 
 static constexpr uint8_t CMD_GET_STATUS          = 0x14;  // query current locked state
 static constexpr uint8_t CMD_CHECK_ADMIN         = 0x41;  // 'A'
 static constexpr uint8_t CMD_CHECK_RANDOM        = 0x30;
+static constexpr uint8_t CMD_CHECK_USER_TIME     = 0x55;  // gets fresh ps_from_lock for unlock sum
 static constexpr uint8_t CMD_UNLOCK              = 0x47;  // COMM_UNLOCK
 static constexpr uint8_t CMD_LOCK                = 0x58;  // COMM_FUNCTION_LOCK
 static constexpr uint8_t CMD_CONFIGURE_PASSAGE   = 0x66;  // COMM_CONFIGURE_PASSAGE_MODE
@@ -114,10 +115,11 @@ class TTLockLock : public lock::Lock,
     QUERY_STATUS,        // querying lock state on connect
     CHECK_ADMIN,
     CHECK_RANDOM,
+    CHECK_USER_TIME_CMD, // 0x55 → gets fresh ps_from_lock for UNLOCK/LOCK sum
     QUERY_PASSAGE_CMD,   // 0x66 QUERY → read passage mode from lock
     PASSAGE_CLEAR_CMD,   // 0x66 CLEAR
-    PASSAGE_ON_CMD,      // 0x66 ADD all-day schedule → then UNLOCK
-    PASSAGE_OFF_CMD,     // 0x66 CLEAR → then LOCK
+    PASSAGE_ON_CMD,      // 0x66 ADD all-day schedule → then CHECK_USER_TIME → UNLOCK
+    PASSAGE_OFF_CMD,     // 0x66 CLEAR → then CHECK_USER_TIME → LOCK
     UNLOCK_CMD,
     LOCK_CMD,
   };
@@ -172,6 +174,7 @@ class TTLockLock : public lock::Lock,
   void do_query_status_();
   void do_check_admin_();
   void do_check_random_();
+  void do_check_user_time_();
   void do_query_passage_();
   void do_passage_clear_();
   void do_passage_on_();
