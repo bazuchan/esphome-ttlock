@@ -250,10 +250,24 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     // The lock disconnects after each operation; showing UNKNOWN on every
     // disconnect causes confusing state flicker in HA.
     case ESP_GATTC_DISCONNECT_EVT:
-      write_handle_  = 0;
-      notify_handle_ = 0;
-      op_state_      = OpState::IDLE;
+      write_handle_   = 0;
+      notify_handle_  = 0;
+      op_state_       = OpState::IDLE;
+      status_queried_ = false;
       rx_buf_.clear();
+      break;
+
+    // ── Connection open failed: CLOSE_EVT may not follow (e.g. reason 0x100) ──
+    case ESP_GATTC_OPEN_EVT:
+      if (param->open.status != ESP_GATT_OK && param->open.status != ESP_GATT_ALREADY_OPEN) {
+        // Base class already called set_idle_(). If pending ops exist, retry.
+        if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_)
+          this->run_later([this]() { this->connect(); });
+      }
+      break;
+
+    // ── Connection closed, reconnect if needed ───────────────────────────────
+    case ESP_GATTC_CLOSE_EVT:
       // If there are still pending operations (e.g. unlock retry), reconnect immediately
       // rather than waiting for the next advertisement.
       if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_)
@@ -547,9 +561,11 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 void TTLockLock::start_pending_() {
   if (pending_passage_on_ || pending_passage_off_ || pending_unlock_ || pending_lock_) {
     do_check_admin_();
-  } else {
+  } else if (!status_queried_) {
+    status_queried_ = true;
     do_query_status_();
   }
+  // else: status already queried this connection, nothing to do
 }
 
 void TTLockLock::do_query_status_() {
@@ -660,6 +676,7 @@ void TTLockPassageSwitch::write_state(bool state) {
 }
 
 void TTLockLock::request_update() {
+  ESP_LOGI(TAG, "Got request to update status");
   auto ble_st = espbt::ESPBTClient::state();
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
     start_pending_();
@@ -669,7 +686,8 @@ void TTLockLock::request_update() {
 
 void TTLockLock::set_passage_mode(bool enable) {
   ESP_LOGI(TAG, "Passage mode %s", enable ? "ON" : "OFF");
-  retry_count_ = 0;
+  retry_count_    = 0;
+  status_queried_ = false;
   passage_mode_ = enable;
   pending_passage_on_  = enable;
   pending_passage_off_ = !enable;
@@ -693,7 +711,8 @@ void TTLockLock::control(const lock::LockCall &call) {
   auto state = call.get_state();
   if (!state.has_value()) return;
 
-  retry_count_ = 0;
+  retry_count_    = 0;
+  status_queried_ = false;
   if (*state == lock::LOCK_STATE_UNLOCKED) {
     pending_unlock_      = true;
     pending_lock_        = false;

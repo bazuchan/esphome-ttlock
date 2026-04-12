@@ -143,6 +143,7 @@ class TTLockLock : public lock::Lock,
   uint8_t  last_adv_params_      {0xFF};  // cached advertisement params; 0xFF = never seen
   uint32_t ps_from_lock_         {0};
   uint8_t  retry_count_          {0};
+  bool     status_queried_       {false};  // true once status+passage queried this connection
   static constexpr uint8_t MAX_RETRIES = 3;
 
   // ── RX buffer (reassembly across MTU chunks) ───────────────────────────
