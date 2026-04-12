@@ -254,6 +254,10 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       notify_handle_ = 0;
       op_state_      = OpState::IDLE;
       rx_buf_.clear();
+      // If there are still pending operations (e.g. unlock retry), reconnect immediately
+      // rather than waiting for the next advertisement.
+      if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_)
+        this->connect();
       break;
 
     default:
@@ -446,6 +450,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         op_state_ = OpState::IDLE;
         if (status == 0x01) {
           pending_unlock_ = false;
+          retry_count_    = 0;
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
@@ -459,10 +464,17 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           if (passage_switch_)
             passage_switch_->publish_state(passage_mode_);
         } else {
-          // Lock rejected the command (status=0x00 = still locked).
-          // Keep pending_unlock_ set so we retry automatically on the next reconnect.
-          ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – will retry", status);
-          this->publish_state(lock::LOCK_STATE_LOCKED);
+          if (++retry_count_ < MAX_RETRIES) {
+            ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d",
+                     status, retry_count_, MAX_RETRIES);
+            this->publish_state(lock::LOCK_STATE_LOCKED);
+            // pending_unlock_ stays set; DISCONNECT_EVT will reconnect
+          } else {
+            ESP_LOGE(TAG, "Unlock failed after %d retries – giving up", MAX_RETRIES);
+            pending_unlock_ = false;
+            retry_count_    = 0;
+            this->publish_state(lock::LOCK_STATE_JAMMED);
+          }
         }
       }
       break;
@@ -472,6 +484,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         op_state_ = OpState::IDLE;
         if (status == 0x01) {
           pending_lock_ = false;
+          retry_count_  = 0;
           passage_mode_ = false;  // locking always exits passage mode
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
@@ -486,9 +499,17 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           if (passage_switch_)
             passage_switch_->publish_state(false);
         } else {
-          // Lock rejected the command – keep pending_lock_ set for retry.
-          ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – will retry", status);
-          this->publish_state(lock::LOCK_STATE_UNLOCKED);
+          if (++retry_count_ < MAX_RETRIES) {
+            ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d",
+                     status, retry_count_, MAX_RETRIES);
+            this->publish_state(lock::LOCK_STATE_UNLOCKED);
+            // pending_lock_ stays set; DISCONNECT_EVT will reconnect
+          } else {
+            ESP_LOGE(TAG, "Lock failed after %d retries – giving up", MAX_RETRIES);
+            pending_lock_ = false;
+            retry_count_  = 0;
+            this->publish_state(lock::LOCK_STATE_JAMMED);
+          }
         }
       }
       break;
@@ -648,6 +669,7 @@ void TTLockLock::request_update() {
 
 void TTLockLock::set_passage_mode(bool enable) {
   ESP_LOGI(TAG, "Passage mode %s", enable ? "ON" : "OFF");
+  retry_count_ = 0;
   passage_mode_ = enable;
   pending_passage_on_  = enable;
   pending_passage_off_ = !enable;
@@ -671,6 +693,7 @@ void TTLockLock::control(const lock::LockCall &call) {
   auto state = call.get_state();
   if (!state.has_value()) return;
 
+  retry_count_ = 0;
   if (*state == lock::LOCK_STATE_UNLOCKED) {
     pending_unlock_      = true;
     pending_lock_        = false;

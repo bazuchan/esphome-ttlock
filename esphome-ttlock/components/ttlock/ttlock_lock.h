@@ -142,6 +142,8 @@ class TTLockLock : public lock::Lock,
   bool     last_status_unlocked_ {false};
   uint8_t  last_adv_params_      {0xFF};  // cached advertisement params; 0xFF = never seen
   uint32_t ps_from_lock_         {0};
+  uint8_t  retry_count_          {0};
+  static constexpr uint8_t MAX_RETRIES = 3;
 
   // ── RX buffer (reassembly across MTU chunks) ───────────────────────────
   std::vector<uint8_t> rx_buf_;
