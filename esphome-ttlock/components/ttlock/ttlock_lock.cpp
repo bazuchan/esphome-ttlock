@@ -233,6 +233,7 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     case ESP_GATTC_REG_FOR_NOTIFY_EVT:
       if (param->reg_for_notify.status == ESP_GATT_OK) {
         ESP_LOGI(TAG, "BLE ready");
+        connect_retry_count_ = 0;  // reset connection retry count on successful link-up
         start_pending_();
       } else {
         ESP_LOGE(TAG, "register_for_notify status=%d", param->reg_for_notify.status);
@@ -261,9 +262,23 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     // ── Connection open failed: CLOSE_EVT may not follow (e.g. reason 0x100) ──
     case ESP_GATTC_OPEN_EVT:
       if (param->open.status != ESP_GATT_OK && param->open.status != ESP_GATT_ALREADY_OPEN) {
-        // Base class already called set_idle_(). If pending ops exist, retry.
-        if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_)
-          this->run_later([this]() { this->connect(); });
+        // Base class already called set_idle_(). Retry if there is work to do:
+        // pending ops (unlock/lock/passage) OR status not yet queried this cycle
+        // (covers request_update() initiated connections).
+        bool has_pending = pending_unlock_ || pending_lock_ ||
+                           pending_passage_on_ || pending_passage_off_;
+        if (has_pending || !status_queried_) {
+          if (++connect_retry_count_ < MAX_RETRIES) {
+            this->run_later([this]() { this->connect(); });
+          } else {
+            connect_retry_count_ = 0;
+            if (has_pending) {
+              pending_unlock_ = pending_lock_ = false;
+              pending_passage_on_ = pending_passage_off_ = false;
+              this->publish_state(lock::LOCK_STATE_JAMMED);
+            }
+          }
+        }
       }
       break;
 
@@ -729,7 +744,8 @@ void TTLockLock::request_update() {
 void TTLockLock::set_passage_mode(bool enable) {
   ESP_LOGI(TAG, "Passage mode %s", enable ? "ON" : "OFF");
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
-  retry_count_    = 0;
+  retry_count_         = 0;
+  connect_retry_count_ = 0;
   status_queried_ = false;
   passage_mode_ = enable;
   pending_passage_on_  = enable;
@@ -755,7 +771,8 @@ void TTLockLock::control(const lock::LockCall &call) {
   if (!state.has_value()) return;
 
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
-  retry_count_    = 0;
+  retry_count_         = 0;
+  connect_retry_count_ = 0;
   status_queried_ = false;
   if (*state == lock::LOCK_STATE_UNLOCKED) {
     pending_unlock_      = true;

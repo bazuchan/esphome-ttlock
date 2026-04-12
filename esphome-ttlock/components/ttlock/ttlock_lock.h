@@ -144,7 +144,8 @@ class TTLockLock : public lock::Lock,
   bool     last_status_unlocked_ {false};
   uint8_t  last_adv_params_      {0xFF};  // cached advertisement params; 0xFF = never seen
   uint32_t ps_from_lock_         {0};
-  uint8_t  retry_count_          {0};
+  uint8_t  retry_count_          {0};  // protocol-level retries (unlock/lock rejection)
+  uint8_t  connect_retry_count_  {0};  // connection-level retries (0x100 / status=133)
   uint64_t request_start_ms_     {0};  // esp_timer ms at control()/set_passage_mode() entry
   bool     status_queried_       {false};  // true once status+passage queried this connection
   static constexpr uint8_t MAX_RETRIES = 3;
