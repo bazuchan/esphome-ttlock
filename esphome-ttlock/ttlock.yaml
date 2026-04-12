@@ -40,12 +40,18 @@ external_components:
       type: local
       path: components
 
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: !secret fd_address
+    id: lock_ble_client
+
 lock:
   - platform: ttlock
     id: front_door_lock
     name: "Front Door"
 
-    address:    !secret fd_address
+    ble_client_id: lock_ble_client
     admin_ps:   !secret fd_admin_ps
     unlock_key: !secret fd_unlock_key
     aes_key:    !secret fd_aes_key

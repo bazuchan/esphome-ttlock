@@ -1,7 +1,8 @@
 #pragma once
 
 #include "esphome/core/component.h"
-#include "esphome/components/esp32_ble_client/ble_client_base.h"
+#include "esphome/components/ble_client/ble_client.h"
+#include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
 #include "esphome/components/lock/lock.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/switch/switch.h"
@@ -17,7 +18,7 @@ namespace esphome {
 namespace ttlock {
 
 namespace espbt = esphome::esp32_ble_tracker;
-namespace ble_client = esphome::esp32_ble_client;
+namespace ble_client = esphome::ble_client;
 
 // ── BLE UUIDs ──────────────────────────────────────────────────────────────
 static constexpr uint16_t SERVICE_UUID  = 0x1910;
@@ -70,15 +71,17 @@ class TTLockPassageSwitch : public switch_::Switch, public Component {
 };
 
 class TTLockLock : public lock::Lock,
-                   public ble_client::BLEClientBase {
+                   public Component,
+                   public ble_client::BLEClientNode,
+                   public espbt::ESPBTDeviceListener {
  public:
   // ── ESPHome Component ──────────────────────────────────────────────────
   void setup() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
-  // ── BLEClientBase ──────────────────────────────────────────────────────
-  bool gattc_event_handler(esp_gattc_cb_event_t event,
+  // ── BLEClientNode ──────────────────────────────────────────────────────
+  void gattc_event_handler(esp_gattc_cb_event_t event,
                            esp_gatt_if_t        gattc_if,
                            esp_ble_gattc_cb_param_t *param) override;
 
@@ -145,7 +148,6 @@ class TTLockLock : public lock::Lock,
   uint8_t  last_adv_params_      {0xFF};  // cached advertisement params; 0xFF = never seen
   uint32_t ps_from_lock_         {0};
   uint8_t  retry_count_          {0};  // protocol-level retries (unlock/lock rejection)
-  uint8_t  connect_retry_count_  {0};  // connection-level retries (0x100 / status=133)
   uint64_t request_start_ms_     {0};  // esp_timer ms at control()/set_passage_mode() entry
   bool     status_queried_       {false};  // true once status+passage queried this connection
   static constexpr uint8_t MAX_RETRIES = 3;

@@ -1,7 +1,8 @@
 """ESPHome TTLock lock platform."""
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import esp32_ble_client, esp32_ble_tracker, lock, sensor, switch
+from esphome.components import esp32_ble_tracker, lock, sensor, switch
+from esphome.components.ble_client import BLEClient, BLEClientNode, CONF_BLE_CLIENT_ID
 from esphome.components.ttlock import ttlock_ns
 from esphome.const import (
     CONF_ID,
@@ -13,18 +14,17 @@ from esphome.const import (
 )
 
 CODEOWNERS = ["@you"]
-DEPENDENCIES = ["esp32_ble_tracker"]
-AUTO_LOAD = ["esp32_ble_client", "sensor", "switch"]
+DEPENDENCIES = ["ble_client", "esp32_ble_tracker"]
+AUTO_LOAD = ["sensor", "switch"]
 ESP_PLATFORMS = [PLATFORM_ESP32]
 
 TTLockLock = ttlock_ns.class_(
-    "TTLockLock", lock.Lock, esp32_ble_client.BLEClientBase
+    "TTLockLock", lock.Lock, cg.Component, BLEClientNode
 )
 TTLockPassageSwitch = ttlock_ns.class_(
     "TTLockPassageSwitch", switch.Switch, cg.Component
 )
 
-CONF_ADDRESS    = "address"
 CONF_ADMIN_PS    = "admin_ps"
 CONF_UNLOCK_KEY  = "unlock_key"
 CONF_AES_KEY     = "aes_key"
@@ -54,8 +54,8 @@ CONFIG_SCHEMA = cv.All(
         {
             cv.GenerateID(): cv.declare_id(TTLockLock),
 
-            # ── BLE address (replaces ble_client_id) ─────────────────────────
-            cv.Required(CONF_ADDRESS): cv.mac_address,
+            # ── BLE client reference ──────────────────────────────────────────
+            cv.Required(CONF_BLE_CLIENT_ID): cv.use_id(BLEClient),
 
             # ── Credentials (required) ────────────────────────────────────────
             cv.Required(CONF_ADMIN_PS):   cv.int_range(min=1, max=0x7FFFFFFF),
@@ -83,8 +83,8 @@ CONFIG_SCHEMA = cv.All(
         }
     )
     .extend(cv.ENTITY_BASE_SCHEMA)
-    .extend(esp32_ble_tracker.ESP_BLE_DEVICE_SCHEMA)
-    .extend(cv.COMPONENT_SCHEMA),
+    .extend(cv.COMPONENT_SCHEMA)
+    .extend(esp32_ble_tracker.ESP_BLE_DEVICE_SCHEMA),
 )
 
 
@@ -92,9 +92,13 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await lock.register_lock(var, config)
-    await esp32_ble_tracker.register_client(var, config)
 
-    cg.add(var.set_address(config[CONF_ADDRESS].as_hex))
+    parent = await cg.get_variable(config[CONF_BLE_CLIENT_ID])
+    cg.add(var.set_ble_client_parent(parent))
+    cg.add(parent.register_ble_node(var))
+
+    await esp32_ble_tracker.register_ble_device(var, config)
+
     cg.add(var.set_admin_ps(config[CONF_ADMIN_PS]))
     cg.add(var.set_unlock_key(config[CONF_UNLOCK_KEY]))
     cg.add(var.set_aes_key(list(bytes.fromhex(config[CONF_AES_KEY]))))

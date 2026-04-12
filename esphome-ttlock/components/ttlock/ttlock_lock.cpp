@@ -1,6 +1,5 @@
 #include "ttlock_lock.h"
 #include "esphome/core/log.h"
-#include "esphome/core/application.h"
 
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -129,8 +128,8 @@ void TTLockLock::send_cmd_(uint8_t cmd, const uint8_t *payload, size_t payload_l
   for (size_t off = 0; off < n; off += MTU_SIZE) {
     size_t chunk = std::min((size_t) MTU_SIZE, n - off);
     esp_err_t err = esp_ble_gattc_write_char(
-        this->get_gattc_if(),
-        this->get_conn_id(),
+        this->parent()->get_gattc_if(),
+        this->parent()->get_conn_id(),
         write_handle_,
         (uint16_t) chunk,
         pkt + off,
@@ -187,43 +186,30 @@ bool TTLockLock::parse_pkt_(const uint8_t *raw, size_t len,
 
 // ── BLE event handler ────────────────────────────────────────────────────────
 
-bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
+void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
                                       esp_gatt_if_t            gattc_if,
                                       esp_ble_gattc_cb_param_t *param) {
-  // Chain to BLEClientBase first: it handles app_id/gattc_if filtering,
-  // stores gattc_if_/conn_id_, manages state transitions, service discovery,
-  // and CCCD descriptor writes.  Returns false if the event is not ours.
-  if (!ble_client::BLEClientBase::gattc_event_handler(event, gattc_if, param))
-    return false;
-
   switch (event) {
-
-    // ── App registration: base stored gattc_if_; schedule connect ───────────
-    case ESP_GATTC_REG_EVT:
-      if (param->reg.status != ESP_GATT_OK) break;  // base already logged
-      ESP_LOGI(TAG, "GATTC registered (if=%d), scheduling connect", this->get_gattc_if());
-      this->run_later([this]() { this->connect(); });
-      break;
 
     // ── Service discovery complete: look up characteristic handles ───────────
     case ESP_GATTC_SEARCH_CMPL_EVT: {
       if (param->search_cmpl.status != ESP_GATT_OK) {
         ESP_LOGE(TAG, "Service search failed: %d", param->search_cmpl.status);
-        this->disconnect();
+        this->parent()->disconnect();
         break;
       }
-      auto *chr_write  = this->get_characteristic(SERVICE_UUID, WRITE_UUID);
-      auto *chr_notify = this->get_characteristic(SERVICE_UUID, NOTIFY_UUID);
+      auto *chr_write  = this->parent()->get_characteristic(SERVICE_UUID, WRITE_UUID);
+      auto *chr_notify = this->parent()->get_characteristic(SERVICE_UUID, NOTIFY_UUID);
       if (!chr_write || !chr_notify) {
         ESP_LOGE(TAG, "TTLock service/characteristics missing – is this a TTLock?");
-        this->disconnect();
+        this->parent()->disconnect();
         break;
       }
       write_handle_  = chr_write->handle;
       notify_handle_ = chr_notify->handle;
       ESP_LOGD(TAG, "Handles write=0x%04X notify=0x%04X", write_handle_, notify_handle_);
       esp_err_t err = esp_ble_gattc_register_for_notify(
-          this->get_gattc_if(), this->get_remote_bda(), notify_handle_);
+          this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), notify_handle_);
       if (err != ESP_OK)
         ESP_LOGE(TAG, "register_for_notify failed: %s", esp_err_to_name(err));
       break;
@@ -233,11 +219,10 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     case ESP_GATTC_REG_FOR_NOTIFY_EVT:
       if (param->reg_for_notify.status == ESP_GATT_OK) {
         ESP_LOGI(TAG, "BLE ready");
-        connect_retry_count_ = 0;  // reset connection retry count on successful link-up
         start_pending_();
       } else {
         ESP_LOGE(TAG, "register_for_notify status=%d", param->reg_for_notify.status);
-        this->disconnect();
+        this->parent()->disconnect();
       }
       break;
 
@@ -247,7 +232,7 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
         on_ble_data_(param->notify.value, param->notify.value_len);
       break;
 
-    // ── Disconnected: reset protocol state ───────────────────────────────────
+    // ── Disconnected: reset protocol state, reconnect if needed ─────────────
     // Do NOT publish UNKNOWN – keep the last known state (LOCKED/UNLOCKED).
     // The lock disconnects after each operation; showing UNKNOWN on every
     // disconnect causes confusing state flicker in HA.
@@ -257,43 +242,17 @@ bool TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       op_state_       = OpState::IDLE;
       status_queried_ = false;
       rx_buf_.clear();
-      break;
-
-    // ── Connection open failed: CLOSE_EVT may not follow (e.g. reason 0x100) ──
-    case ESP_GATTC_OPEN_EVT:
-      if (param->open.status != ESP_GATT_OK && param->open.status != ESP_GATT_ALREADY_OPEN) {
-        // Base class already called set_idle_(). Retry if there is work to do:
-        // pending ops (unlock/lock/passage) OR status not yet queried this cycle
-        // (covers request_update() initiated connections).
-        bool has_pending = pending_unlock_ || pending_lock_ ||
-                           pending_passage_on_ || pending_passage_off_;
-        if (has_pending || !status_queried_) {
-          if (++connect_retry_count_ < MAX_RETRIES) {
-            this->run_later([this]() { this->connect(); });
-          } else {
-            connect_retry_count_ = 0;
-            if (has_pending) {
-              pending_unlock_ = pending_lock_ = false;
-              pending_passage_on_ = pending_passage_off_ = false;
-              this->publish_state(lock::LOCK_STATE_JAMMED);
-            }
-          }
-        }
-      }
-      break;
-
-    // ── Connection closed, reconnect if needed ───────────────────────────────
-    case ESP_GATTC_CLOSE_EVT:
       // If there are still pending operations (e.g. unlock retry), reconnect immediately
       // rather than waiting for the next advertisement.
-      if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_)
-        this->connect();
+      if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_) {
+        this->parent()->set_enabled(true);
+        this->parent()->connect();
+      }
       break;
 
     default:
       break;
   }
-  return true;
 }
 
 // ── Data reception  (reassemble MTU chunks → complete frame) ─────────────────
@@ -425,6 +384,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           do_lock_();
         } else {
           op_state_ = OpState::IDLE;
+          this->parent()->set_enabled(false);
         }
       } else {
         ESP_LOGE(TAG, "CHECK_USER_TIME failed (cmd=0x%02X status=0x%02X len=%d)",
@@ -438,6 +398,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           do_lock_();
         } else {
           op_state_ = OpState::IDLE;
+          this->parent()->set_enabled(false);
         }
       }
       break;
@@ -459,10 +420,12 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           do_check_user_time_();
         } else {
           op_state_ = OpState::IDLE;
+          this->parent()->set_enabled(false);  // done – stop auto-reconnect
         }
       } else {
         ESP_LOGW(TAG, "Unexpected response in QUERY_PASSAGE_CMD (cmd=0x%02X)", cmd);
         op_state_ = OpState::IDLE;
+        this->parent()->set_enabled(false);
       }
       break;
 
@@ -516,6 +479,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           this->publish_state(lock::LOCK_STATE_UNLOCKED);
           if (passage_switch_)
             passage_switch_->publish_state(passage_mode_);
+          this->parent()->set_enabled(false);  // done – stop auto-reconnect
         } else {
           if (++retry_count_ < MAX_RETRIES) {
             ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
@@ -528,6 +492,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
             pending_unlock_ = false;
             retry_count_    = 0;
             this->publish_state(lock::LOCK_STATE_JAMMED);
+            this->parent()->set_enabled(false);
           }
         }
       }
@@ -553,6 +518,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           this->publish_state(lock::LOCK_STATE_LOCKED);
           if (passage_switch_)
             passage_switch_->publish_state(false);
+          this->parent()->set_enabled(false);  // done – stop auto-reconnect
         } else {
           if (++retry_count_ < MAX_RETRIES) {
             ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
@@ -565,6 +531,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
             pending_lock_ = false;
             retry_count_  = 0;
             this->publish_state(lock::LOCK_STATE_JAMMED);
+            this->parent()->set_enabled(false);
           }
         }
       }
@@ -734,18 +701,18 @@ void TTLockPassageSwitch::write_state(bool state) {
 
 void TTLockLock::request_update() {
   ESP_LOGI(TAG, "Got request to update status");
-  auto ble_st = espbt::ESPBTClient::state();
+  this->parent()->set_enabled(true);
+  auto ble_st = this->parent()->state();
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
     start_pending_();
   else if (ble_st == espbt::ClientState::IDLE)
-    this->connect();
+    this->parent()->connect();
 }
 
 void TTLockLock::set_passage_mode(bool enable) {
   ESP_LOGI(TAG, "Passage mode %s", enable ? "ON" : "OFF");
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
-  retry_count_         = 0;
-  connect_retry_count_ = 0;
+  retry_count_    = 0;
   status_queried_ = false;
   passage_mode_ = enable;
   pending_passage_on_  = enable;
@@ -757,11 +724,12 @@ void TTLockLock::set_passage_mode(bool enable) {
   } else {
     this->publish_state(lock::LOCK_STATE_LOCKING);
   }
-  auto ble_st = espbt::ESPBTClient::state();
+  this->parent()->set_enabled(true);
+  auto ble_st = this->parent()->state();
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
     start_pending_();
   else if (ble_st == espbt::ClientState::IDLE)
-    this->connect();
+    this->parent()->connect();
 }
 
 // ── lock::Lock interface ─────────────────────────────────────────────────────
@@ -770,9 +738,9 @@ void TTLockLock::control(const lock::LockCall &call) {
   auto state = call.get_state();
   if (!state.has_value()) return;
 
+  this->parent()->set_enabled(true);
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
-  retry_count_         = 0;
-  connect_retry_count_ = 0;
+  retry_count_    = 0;
   status_queried_ = false;
   if (*state == lock::LOCK_STATE_UNLOCKED) {
     pending_unlock_      = true;
@@ -781,11 +749,11 @@ void TTLockLock::control(const lock::LockCall &call) {
     pending_passage_off_ = false;
     this->publish_state(lock::LOCK_STATE_UNLOCKING);
     {
-      auto ble_st = espbt::ESPBTClient::state();
+      auto ble_st = this->parent()->state();
       if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
         start_pending_();
       else if (ble_st == espbt::ClientState::IDLE)
-        this->connect();
+        this->parent()->connect();
     }
 
   } else if (*state == lock::LOCK_STATE_LOCKED) {
@@ -797,11 +765,11 @@ void TTLockLock::control(const lock::LockCall &call) {
       pending_passage_on_  = false;
       pending_passage_off_ = false;
       this->publish_state(lock::LOCK_STATE_LOCKING);
-      auto ble_st = espbt::ESPBTClient::state();
+      auto ble_st = this->parent()->state();
       if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
         start_pending_();
       else if (ble_st == espbt::ClientState::IDLE)
-        this->connect();
+        this->parent()->connect();
     }
   }
 }
@@ -809,12 +777,8 @@ void TTLockLock::control(const lock::LockCall &call) {
 // ── Component lifecycle ──────────────────────────────────────────────────────
 
 void TTLockLock::setup() {
-  // BLEClientBase::setup() assigns the connection_index_.
-  // GATTC app registration happens lazily in loop() once BLE is active.
-  ble_client::BLEClientBase::setup();
   this->publish_state(lock::LOCK_STATE_NONE);
-  ESP_LOGI(TAG, "TTLock setup: app_id=%d addr=%s", this->app_id, this->address_str());
-  esp32_ble_tracker::global_esp32_ble_tracker->register_listener(this);
+  ESP_LOGI(TAG, "TTLock setup: addr=%s", this->parent()->address_str());
 }
 
 // ── Advertisement parser ─────────────────────────────────────────────────────
@@ -828,7 +792,7 @@ void TTLockLock::setup() {
 
 bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
   // Only handle our lock
-  if (device.address_str() != this->address_str())
+  if (device.address_str() != this->parent()->address_str())
     return false;
 
   for (const auto &mfr : device.get_manufacturer_datas()) {
@@ -860,9 +824,13 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     if (battery != 0xFF && battery_sensor_)
       battery_sensor_->publish_state((float) battery);
 
-    // Params changed → connect to get fresh status + passage query.
-    // set_enabled(true) re-arms the BLEClient so it will connect on the next
-    // advertisement (or immediately if already in range).
+    // Params changed → trigger a status/passage query connection.
+    // set_enabled(true) is enough: the tracker calls listeners_ before clients_,
+    // so BLEClient::parse_device() runs next (in the same advertisement) and
+    // sees enabled=true → sets DISCOVERED → tracker promotes sequentially.
+    // Calling connect() directly here would bypass that sequencing and cause
+    // both locks to attempt simultaneous connections, hanging the BLE stack.
+    this->parent()->set_enabled(true);
     return true;
   }
   return false;
@@ -870,7 +838,7 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
 
 void TTLockLock::dump_config() {
   LOG_LOCK("", "TTLock", this);
-  ESP_LOGCONFIG(TAG, "  Address: %s", this->address_str());
+  ESP_LOGCONFIG(TAG, "  Address: %s", this->parent()->address_str());
   ESP_LOGCONFIG(TAG, "  Protocol: type=0x%02X  ver=0x%02X  scene=0x%02X  group=0x%04X  org=0x%04X",
                 lv_.proto_type, lv_.proto_ver, lv_.scene, lv_.group_id, lv_.org_id);
   ESP_LOGCONFIG(TAG, "  Credentials: configured");
