@@ -240,7 +240,6 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       write_handle_   = 0;
       notify_handle_  = 0;
       op_state_       = OpState::IDLE;
-      status_queried_ = false;
       rx_buf_.clear();
       // If there are still pending operations (e.g. unlock retry), reconnect immediately
       // rather than waiting for the next advertisement.
@@ -570,11 +569,9 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 void TTLockLock::start_pending_() {
   if (pending_passage_on_ || pending_passage_off_ || pending_unlock_ || pending_lock_) {
     do_check_admin_();
-  } else if (!status_queried_) {
-    status_queried_ = true;
+  } else {
     do_query_status_();
   }
-  // else: status already queried this connection, nothing to do
 }
 
 void TTLockLock::do_query_status_() {
@@ -712,8 +709,7 @@ void TTLockLock::request_update() {
 void TTLockLock::set_passage_mode(bool enable) {
   ESP_LOGI(TAG, "Passage mode %s", enable ? "ON" : "OFF");
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
-  retry_count_    = 0;
-  status_queried_ = false;
+  retry_count_ = 0;
   passage_mode_ = enable;
   pending_passage_on_  = enable;
   pending_passage_off_ = !enable;
@@ -740,8 +736,7 @@ void TTLockLock::control(const lock::LockCall &call) {
 
   this->parent()->set_enabled(true);
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
-  retry_count_    = 0;
-  status_queried_ = false;
+  retry_count_ = 0;
   if (*state == lock::LOCK_STATE_UNLOCKED) {
     pending_unlock_      = true;
     pending_lock_        = false;
@@ -806,23 +801,30 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     } else {
       if (mfr.data.size() < 7) continue;
       params = mfr.data[6];
-    }
-
-    // Suppress duplicate advertisements
-    if (params == last_adv_params_)
-      return false;
-    last_adv_params_ = params;
-
-    bool is_unlocked = (params & 0x01) != 0;
-    ESP_LOGI(TAG, "ADV params=0x%02X -> %s", params, is_unlocked ? "UNLOCKED" : "LOCKED");
-
-    // Don't overwrite state mid-operation (GATTC sequence is authoritative)
-    if (op_state_ == OpState::IDLE) {
-      this->publish_state(is_unlocked ? lock::LOCK_STATE_UNLOCKED : lock::LOCK_STATE_LOCKED);
+      if (mfr.data.size() >= 8) battery = mfr.data[7];
     }
 
     if (battery != 0xFF && battery_sensor_)
       battery_sensor_->publish_state((float) battery);
+
+    // Ignore park status reports
+    if (params & 0x10)
+      return false;
+
+    lock::LockState state = this->state;
+    lock::LockState adv_state = (params & 0x01) ? lock::LOCK_STATE_UNLOCKED : lock::LOCK_STATE_LOCKED;
+
+    // Suppress duplicate advertisements
+    if ((params == last_adv_params_) && (state == adv_state))
+      return false;
+    last_adv_params_ = params;
+
+    ESP_LOGI(TAG, "[%s] ADV params=0x%02X -> %s, current state -> %s", device.address_str().c_str(), params, lock::lock_state_to_string(adv_state), lock::lock_state_to_string(state));
+
+    // Don't overwrite state mid-operation (GATTC sequence is authoritative)
+    if (!(pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_)) {
+      this->publish_state(adv_state);
+    }
 
     // Params changed → trigger a status/passage query connection.
     // set_enabled(true) is enough: the tracker calls listeners_ before clients_,
