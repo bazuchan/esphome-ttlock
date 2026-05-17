@@ -127,6 +127,16 @@ class TTLockLock : public lock::Lock,
     LOCK_CMD,
   };
 
+  // What the current (or next) connection attempt is for.
+  enum class PendingOp : uint8_t {
+    NONE,
+    QUERY,       // passive status+passage check (from parse_device / request_update)
+    UNLOCK,
+    LOCK,
+    PASSAGE_ON,
+    PASSAGE_OFF,
+  };
+
   // ── BLE characteristic handles ─────────────────────────────────────────
   uint16_t write_handle_  {0};
   uint16_t notify_handle_ {0};
@@ -138,12 +148,9 @@ class TTLockLock : public lock::Lock,
   LockVersion lv_;
 
   // ── Operation state ────────────────────────────────────────────────────
-  OpState  op_state_             {OpState::IDLE};
-  bool     pending_unlock_       {false};
-  bool     pending_lock_         {false};
-  bool     pending_passage_on_   {false};
-  bool     pending_passage_off_  {false};
-  bool     passage_mode_         {false};
+  OpState   op_state_   {OpState::IDLE};
+  PendingOp pending_op_ {PendingOp::NONE};
+  bool      passage_mode_ {false};
   bool     last_status_unlocked_ {false};
   uint8_t  last_adv_params_      {0xFF};  // cached advertisement params; 0xFF = never seen
   uint32_t ps_from_lock_         {0};

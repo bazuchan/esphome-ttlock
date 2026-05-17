@@ -241,16 +241,15 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       notify_handle_  = 0;
       op_state_       = OpState::IDLE;
       rx_buf_.clear();
-      // If there are still pending operations (e.g. unlock retry), reconnect immediately
-      // rather than waiting for the next advertisement.
-      if (pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_) {
+      if (pending_op_ == PendingOp::NONE) {
+        // No pending operation: stop auto-reconnect.
+        this->parent()->set_enabled(false);
+      } else {
+        // If there are still pending operations (e.g. unlock retry), reconnect immediately
+        // rather than waiting for the next advertisement.
         this->parent()->set_enabled(true);
         if (this->parent()->state() == espbt::ClientState::IDLE)
           this->parent()->set_state(espbt::ClientState::DISCOVERED);
-      } else {
-        // No pending operations: disable so the scanner can resume.
-        // parse_device() will re-enable when the lock next advertises with changed params.
-        this->parent()->set_enabled(false);
       }
       break;
 
@@ -341,34 +340,38 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
       } else {
         ESP_LOGE(TAG, "CHECK_ADMIN failed (cmd=0x%02X status=0x%02X len=%d)",
                  cmd, status, data.size());
-        op_state_            = OpState::IDLE;
-        pending_unlock_      = pending_lock_ = false;
-        pending_passage_on_  = pending_passage_off_ = false;
+        op_state_   = OpState::IDLE;
+        pending_op_ = PendingOp::NONE;
         this->publish_state(lock::LOCK_STATE_JAMMED);
       }
       break;
 
     case OpState::CHECK_RANDOM:
       if (cmd == CMD_CHECK_RANDOM) {
-        if (pending_passage_on_) {
-          op_state_ = OpState::PASSAGE_ON_CMD;
-          do_passage_on_();
-        } else if (pending_passage_off_) {
-          op_state_ = OpState::PASSAGE_OFF_CMD;
-          do_passage_off_();
-        } else if (pending_unlock_ || pending_lock_) {
-          // Always get a fresh ps_from_lock from CHECK_USER_TIME before
-          // UNLOCK/LOCK — some lock models return a different token from
-          // the one supplied by CHECK_ADMIN and validate against it in UNLOCK.
-          do_check_user_time_();
-        } else {
-          do_query_passage_();
+        switch (pending_op_) {
+          case PendingOp::PASSAGE_ON:
+            op_state_ = OpState::PASSAGE_ON_CMD;
+            do_passage_on_();
+            break;
+          case PendingOp::PASSAGE_OFF:
+            op_state_ = OpState::PASSAGE_OFF_CMD;
+            do_passage_off_();
+            break;
+          case PendingOp::UNLOCK:
+          case PendingOp::LOCK:
+            // Always get a fresh ps_from_lock from CHECK_USER_TIME before
+            // UNLOCK/LOCK — some lock models return a different token from
+            // the one supplied by CHECK_ADMIN and validate against it in UNLOCK.
+            do_check_user_time_();
+            break;
+          default:
+            do_query_passage_();
+            break;
         }
       } else {
         ESP_LOGE(TAG, "CHECK_RANDOM failed (cmd=0x%02X status=0x%02X)", cmd, status);
-        op_state_            = OpState::IDLE;
-        pending_unlock_      = pending_lock_ = false;
-        pending_passage_on_  = pending_passage_off_ = false;
+        op_state_   = OpState::IDLE;
+        pending_op_ = PendingOp::NONE;
         this->publish_state(lock::LOCK_STATE_JAMMED);
       }
       break;
@@ -380,28 +383,30 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         ps_from_lock_ = ((uint32_t) data[2] << 24) | ((uint32_t) data[3] << 16) |
                         ((uint32_t) data[4] <<  8) |  (uint32_t) data[5];
         ESP_LOGD(TAG, "CHECK_USER_TIME: ps_from_lock=0x%08X", (unsigned) ps_from_lock_);
-        if (pending_unlock_) {
+        if (pending_op_ == PendingOp::UNLOCK) {
           op_state_ = OpState::UNLOCK_CMD;
           do_unlock_();
-        } else if (pending_lock_) {
+        } else if (pending_op_ == PendingOp::LOCK) {
           op_state_ = OpState::LOCK_CMD;
           do_lock_();
         } else {
-          op_state_ = OpState::IDLE;
+          op_state_   = OpState::IDLE;
+          pending_op_ = PendingOp::NONE;
           this->parent()->set_enabled(false);
         }
       } else {
         ESP_LOGE(TAG, "CHECK_USER_TIME failed (cmd=0x%02X status=0x%02X len=%d)",
                  cmd, status, data.size());
         // Fall back: proceed with existing ps_from_lock from CHECK_ADMIN
-        if (pending_unlock_) {
+        if (pending_op_ == PendingOp::UNLOCK) {
           op_state_ = OpState::UNLOCK_CMD;
           do_unlock_();
-        } else if (pending_lock_) {
+        } else if (pending_op_ == PendingOp::LOCK) {
           op_state_ = OpState::LOCK_CMD;
           do_lock_();
         } else {
-          op_state_ = OpState::IDLE;
+          op_state_   = OpState::IDLE;
+          pending_op_ = PendingOp::NONE;
           this->parent()->set_enabled(false);
         }
       }
@@ -420,29 +425,30 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         // Re-unlock if passage mode is active but the lock reported LOCKED.
         if (passage_mode_ && !last_status_unlocked_) {
           ESP_LOGI(TAG, "Passage mode active but locked – re-unlocking");
-          pending_unlock_ = true;
+          pending_op_ = PendingOp::UNLOCK;
           do_check_user_time_();
         } else {
-          op_state_ = OpState::IDLE;
+          op_state_   = OpState::IDLE;
+          pending_op_ = PendingOp::NONE;
           this->parent()->set_enabled(false);  // done – stop auto-reconnect
         }
       } else {
         ESP_LOGW(TAG, "Unexpected response in QUERY_PASSAGE_CMD (cmd=0x%02X)", cmd);
-        op_state_ = OpState::IDLE;
+        op_state_   = OpState::IDLE;
+        pending_op_ = PendingOp::NONE;
         this->parent()->set_enabled(false);
       }
       break;
 
     case OpState::PASSAGE_ON_CMD:
       if (cmd == CMD_CONFIGURE_PASSAGE) {
-        pending_passage_on_ = false;
-        passage_mode_       = true;
+        passage_mode_ = true;
         if (status == 0x01) {
           ESP_LOGI(TAG, "Passage mode ADD acknowledged, unlocking");
         } else {
           ESP_LOGW(TAG, "Passage mode ADD status=0x%02X (proceeding anyway)", status);
         }
-        pending_unlock_ = true;
+        pending_op_ = PendingOp::UNLOCK;
         do_check_user_time_();
       }
       break;
@@ -450,15 +456,14 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
     case OpState::PASSAGE_OFF_CMD:
       if (cmd == CMD_CONFIGURE_PASSAGE) {
         if (status == 0x01) {
-          pending_passage_off_ = false;
-          passage_mode_        = false;
+          passage_mode_ = false;
           ESP_LOGI(TAG, "Passage mode cleared, locking");
-          pending_lock_ = true;
+          pending_op_ = PendingOp::LOCK;
           do_check_user_time_();
         } else {
           ESP_LOGE(TAG, "Passage mode disable failed (status=0x%02X)", status);
-          pending_passage_off_ = false;
-          op_state_            = OpState::IDLE;
+          op_state_   = OpState::IDLE;
+          pending_op_ = PendingOp::NONE;
           this->publish_state(lock::LOCK_STATE_JAMMED);
         }
       }
@@ -469,8 +474,8 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         op_state_ = OpState::IDLE;
         uint32_t elapsed_ms = (uint32_t)((uint64_t) esp_timer_get_time() / 1000 - request_start_ms_);
         if (status == 0x01) {
-          pending_unlock_ = false;
-          retry_count_    = 0;
+          pending_op_  = PendingOp::NONE;
+          retry_count_ = 0;
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
           if (data.size() >= 3) {
             uint8_t battery = data[2];
@@ -489,12 +494,12 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
             ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
                      status, retry_count_, MAX_RETRIES, elapsed_ms);
             this->publish_state(lock::LOCK_STATE_LOCKED);
-            // pending_unlock_ stays set; DISCONNECT_EVT will reconnect
+            // pending_op_ stays UNLOCK; DISCONNECT_EVT will reconnect
           } else {
             ESP_LOGE(TAG, "Unlock failed after %d retries – giving up  elapsed=%ums",
                      MAX_RETRIES, elapsed_ms);
-            pending_unlock_ = false;
-            retry_count_    = 0;
+            pending_op_  = PendingOp::NONE;
+            retry_count_ = 0;
             this->publish_state(lock::LOCK_STATE_JAMMED);
             this->parent()->set_enabled(false);
           }
@@ -507,7 +512,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         op_state_ = OpState::IDLE;
         uint32_t elapsed_ms = (uint32_t)((uint64_t) esp_timer_get_time() / 1000 - request_start_ms_);
         if (status == 0x01) {
-          pending_lock_ = false;
+          pending_op_   = PendingOp::NONE;
           retry_count_  = 0;
           passage_mode_ = false;  // locking always exits passage mode
           // Battery is only valid in the full success response (≥3 bytes, status=0x01)
@@ -528,12 +533,12 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
             ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
                      status, retry_count_, MAX_RETRIES, elapsed_ms);
             this->publish_state(lock::LOCK_STATE_UNLOCKED);
-            // pending_lock_ stays set; DISCONNECT_EVT will reconnect
+            // pending_op_ stays LOCK; DISCONNECT_EVT will reconnect
           } else {
             ESP_LOGE(TAG, "Lock failed after %d retries – giving up  elapsed=%ums",
                      MAX_RETRIES, elapsed_ms);
-            pending_lock_ = false;
-            retry_count_  = 0;
+            pending_op_  = PendingOp::NONE;
+            retry_count_ = 0;
             this->publish_state(lock::LOCK_STATE_JAMMED);
             this->parent()->set_enabled(false);
           }
@@ -557,7 +562,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
             passage_switch_->publish_state(passage_mode_);
           if (passage_mode_) {
             ESP_LOGI(TAG, "Passage mode active, re-unlocking after unsolicited lock");
-            pending_unlock_ = true;
+            pending_op_ = PendingOp::UNLOCK;
             do_check_admin_();
           }
         }
@@ -572,7 +577,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 // ── Normal operation sequence ─────────────────────────────────────────────────
 
 void TTLockLock::start_pending_() {
-  if (pending_passage_on_ || pending_passage_off_ || pending_unlock_ || pending_lock_) {
+  if (pending_op_ != PendingOp::NONE && pending_op_ != PendingOp::QUERY) {
     do_check_admin_();
   } else {
     do_query_status_();
@@ -703,6 +708,8 @@ void TTLockPassageSwitch::write_state(bool state) {
 
 void TTLockLock::request_update() {
   ESP_LOGI(TAG, "Got request to update status");
+  if (pending_op_ == PendingOp::NONE)
+    pending_op_ = PendingOp::QUERY;
   this->parent()->set_enabled(true);
   auto ble_st = this->parent()->state();
   if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
@@ -716,10 +723,7 @@ void TTLockLock::set_passage_mode(bool enable) {
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
   retry_count_ = 0;
   passage_mode_ = enable;
-  pending_passage_on_  = enable;
-  pending_passage_off_ = !enable;
-  pending_unlock_      = false;
-  pending_lock_        = false;
+  pending_op_   = enable ? PendingOp::PASSAGE_ON : PendingOp::PASSAGE_OFF;
   if (enable) {
     this->publish_state(lock::LOCK_STATE_UNLOCKING);
   } else {
@@ -743,10 +747,7 @@ void TTLockLock::control(const lock::LockCall &call) {
   request_start_ms_ = (uint64_t) esp_timer_get_time() / 1000;
   retry_count_ = 0;
   if (*state == lock::LOCK_STATE_UNLOCKED) {
-    pending_unlock_      = true;
-    pending_lock_        = false;
-    pending_passage_on_  = false;
-    pending_passage_off_ = false;
+    pending_op_ = PendingOp::UNLOCK;
     this->publish_state(lock::LOCK_STATE_UNLOCKING);
     {
       auto ble_st = this->parent()->state();
@@ -760,10 +761,7 @@ void TTLockLock::control(const lock::LockCall &call) {
     if (passage_mode_) {
       set_passage_mode(false);
     } else {
-      pending_lock_        = true;
-      pending_unlock_      = false;
-      pending_passage_on_  = false;
-      pending_passage_off_ = false;
+      pending_op_ = PendingOp::LOCK;
       this->publish_state(lock::LOCK_STATE_LOCKING);
       auto ble_st = this->parent()->state();
       if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
@@ -827,14 +825,17 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     ESP_LOGI(TAG, "[%s] ADV params=0x%02X -> %s, current state -> %s", device.address_str().c_str(), params, lock::lock_state_to_string(adv_state), lock::lock_state_to_string(state));
 
     // Don't overwrite state mid-operation (GATTC sequence is authoritative)
-    if (!(pending_unlock_ || pending_lock_ || pending_passage_on_ || pending_passage_off_)) {
+    if ((pending_op_ == PendingOp::NONE) || (pending_op_ == PendingOp::QUERY)) {
       this->publish_state(adv_state);
     }
 
     // Params changed → trigger a status/passage query connection.
+    // PendingOp::QUERY makes the watchdog active for this connection (not just user ops).
     // Use set_state(DISCOVERED) so the tracker stops the scanner before connecting;
     // calling connect() directly while the scanner is RUNNING leaves scanner_state_
     // stuck at RUNNING after disconnect, preventing scan restart.
+    if (pending_op_ == PendingOp::NONE)
+      pending_op_ = PendingOp::QUERY;
     this->parent()->set_enabled(true);
     if (this->parent()->state() == espbt::ClientState::IDLE)
       this->parent()->set_state(espbt::ClientState::DISCOVERED);
