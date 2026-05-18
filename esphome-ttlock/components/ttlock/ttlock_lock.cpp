@@ -192,6 +192,18 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
                                       esp_ble_gattc_cb_param_t *param) {
   switch (event) {
 
+    // ── Connection open (possibly failed) ────────────────────────────────────
+    // BLEClientBase already called set_idle_() before this node handler runs,
+    // so state is IDLE here on failure. Trigger reconnect directly — no defer needed.
+    case ESP_GATTC_OPEN_EVT:
+      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE &&
+          this->parent()->state() == espbt::ClientState::IDLE) {
+        ESP_LOGD(TAG, "OPEN_EVT error (status=%d), reconnecting for pending op=%d",
+                 param->open.status, (int) pending_op_);
+        this->parent()->set_state(espbt::ClientState::DISCOVERED);
+      }
+      break;
+
     // ── Service discovery complete: look up characteristic handles ───────────
     case ESP_GATTC_SEARCH_CMPL_EVT: {
       if (param->search_cmpl.status != ESP_GATT_OK) {
@@ -233,25 +245,48 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
         on_ble_data_(param->notify.value, param->notify.value_len);
       break;
 
-    // ── Disconnected: reset protocol state, reconnect if needed ─────────────
-    // Do NOT publish UNKNOWN – keep the last known state (LOCKED/UNLOCKED).
-    // The lock disconnects after each operation; showing UNKNOWN on every
-    // disconnect causes confusing state flicker in HA.
+    // ── Disconnected: protocol cleanup only ──────────────────────────────────
+    // Do NOT publish UNKNOWN – keep the last known state to avoid HA flicker.
+    // Reconnect decisions are made in CLOSE_EVT (state guaranteed IDLE there).
+    // For connection failures (reason=0x100) CLOSE_EVT may not follow; those
+    // are handled by OPEN_EVT above.
     case ESP_GATTC_DISCONNECT_EVT:
       write_handle_   = 0;
       notify_handle_  = 0;
       op_state_       = OpState::IDLE;
       rx_buf_.clear();
-      if (pending_op_ == PendingOp::NONE) {
-        // No pending operation: stop auto-reconnect.
-        this->parent()->set_enabled(false);
-      } else {
-        // If there are still pending operations (e.g. unlock retry), reconnect immediately
-        // rather than waiting for the next advertisement.
-        arm_op_watchdog_();  // re-arm for each retry so the full 90 s window resets
+      // 0x100 = ESP_GATT_CONN_CONN_CANCEL: connection-establishment timeout,
+      // never follows a completed op. BLEClientBase may auto-connect before
+      // parse_device runs (leaving pending_op_==NONE). Treat as QUERY so that
+      // the reconnect paths below activate instead of calling set_enabled(false).
+      if (param->disconnect.reason == 0x0100 && pending_op_ == PendingOp::NONE)
+        pending_op_ = PendingOp::QUERY;
+      if (pending_op_ != PendingOp::NONE) {
+        arm_op_watchdog_();
         this->parent()->set_enabled(true);
-        if (this->parent()->state() == espbt::ClientState::IDLE)
-          this->parent()->set_state(espbt::ClientState::DISCOVERED);
+        // For connection failures (reason=0x100) CLOSE_EVT may not fire.
+        // The OPEN_EVT handler triggers reconnect synchronously, but a UART-flush
+        // delay between BLEClientBase log lines can allow the tracker's loop() to
+        // start the scanner before OPEN_EVT is fully processed. run_later fires at
+        // the end of this loop iteration when OPEN_EVT has settled and state is IDLE.
+        // If OPEN_EVT already triggered reconnect (state=CONNECTING), this is a no-op.
+        this->parent()->run_later([this]() {
+          if (pending_op_ != PendingOp::NONE &&
+              this->parent()->state() == espbt::ClientState::IDLE)
+            this->parent()->set_state(espbt::ClientState::DISCOVERED);
+        });
+      }
+      break;
+
+    // ── BLE stack fully cleaned up: make reconnect decision ──────────────────
+    // BLEClientBase called set_idle_() before our handler runs, so state is
+    // guaranteed IDLE here. No run_later needed.
+    // Not fired for connection failures (reason=0x100) — OPEN_EVT covers that.
+    case ESP_GATTC_CLOSE_EVT:
+      if (pending_op_ != PendingOp::NONE) {
+        this->parent()->set_state(espbt::ClientState::DISCOVERED);
+      } else {
+        this->parent()->set_enabled(false);
       }
       break;
 
@@ -844,7 +879,8 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     }
 
     if (battery != 0xFF && battery_sensor_)
-      battery_sensor_->publish_state((float) battery);
+      if (battery_sensor_->get_state() != (float) battery)
+        battery_sensor_->publish_state((float) battery);
 
     // Ignore park status reports
     if (params & 0x10)
@@ -853,10 +889,9 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     lock::LockState state = this->state;
     lock::LockState adv_state = (params & 0x01) ? lock::LOCK_STATE_UNLOCKED : lock::LOCK_STATE_LOCKED;
 
-    // Suppress duplicate advertisements
-    if ((params == last_adv_params_) && (state == adv_state))
+    // Suppress duplicate advertisements, but not when there's a pending reconnect.
+    if ((state == adv_state) && (pending_op_ == PendingOp::NONE))
       return false;
-    last_adv_params_ = params;
 
     ESP_LOGI(TAG, "[%s] ADV params=0x%02X -> %s, current state -> %s", device.address_str().c_str(), params, lock::lock_state_to_string(adv_state), lock::lock_state_to_string(state));
 
