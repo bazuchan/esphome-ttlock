@@ -178,6 +178,14 @@ class TTLockLock : public lock::Lock,
   void on_ble_data_(const uint8_t *data, uint16_t len);
   void handle_response_(uint8_t cmd, const std::vector<uint8_t> &payload);
 
+  // ── Cross-instance BLE radio arbitration ────────────────────────────────
+  // Only one instance may hold the BLE client enabled at a time; others queue
+  // and get a fresh op watchdog once it's actually their turn.
+  static TTLockLock              *active_lock_;
+  static std::vector<TTLockLock *> queue_;
+  void begin_op_();
+  void finish_op_();
+
   // ── Lock/unlock sequence ───────────────────────────────────────────────
   void arm_op_watchdog_();
   void start_pending_();
