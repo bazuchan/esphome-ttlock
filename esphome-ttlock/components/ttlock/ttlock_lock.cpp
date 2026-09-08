@@ -608,32 +608,27 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 }
 
 // ── Operation watchdog ────────────────────────────────────────────────────────
-// Arms a 90-second one-shot timeout.  If pending operations are still set when
-// it fires, either the BLEClient is IDLE (stay enabled and re-arm — it'll pick
-// the device back up off its own next advertisement) or it is stuck in
-// CONNECTING/DISCONNECTING (clear ops; publish JAMMED only for user-initiated ops).
+// Arms a 90-second one-shot timeout. If pending_op_ is still set when it fires,
+// give up unconditionally — whether the BLEClient is IDLE (advertisement just
+// hasn't arrived yet) or genuinely stuck in CONNECTING/DISCONNECTING, it has
+// had its full 90s. This must be unconditional, not just re-armed while IDLE:
+// active_lock_ is shared across instances now, so an open-ended retry loop
+// here would hold the radio hostage from every other queued lock indefinitely.
 
 void TTLockLock::arm_op_watchdog_() {
   cancel_timeout("op_wdog");
   set_timeout("op_wdog", 90000, [this]() {
     if (pending_op_ == PendingOp::NONE)
       return;
-    auto st = this->parent()->state();
-    ESP_LOGW(TAG, "Op watchdog fired (client state=%d)", (int) st);
-    if (st == espbt::ClientState::IDLE) {
-      ESP_LOGW(TAG, "Watchdog: client IDLE with pending ops – waiting for advertisement");
-      this->parent()->set_enabled(true);
-      arm_op_watchdog_();
-    } else {
-      bool had_user_op = (pending_op_ != PendingOp::QUERY);
-      ESP_LOGE(TAG, "Watchdog: client stuck – abandoning pending ops");
-      pending_op_ = PendingOp::NONE;
-      op_state_   = OpState::IDLE;
-      rx_buf_.clear();
-      if (had_user_op)
-        this->publish_state(lock::LOCK_STATE_JAMMED);
-      finish_op_();
-    }
+    ESP_LOGE(TAG, "Op watchdog fired (client state=%d) – abandoning pending ops",
+             (int) this->parent()->state());
+    bool had_user_op = (pending_op_ != PendingOp::QUERY);
+    pending_op_ = PendingOp::NONE;
+    op_state_   = OpState::IDLE;
+    rx_buf_.clear();
+    if (had_user_op)
+      this->publish_state(lock::LOCK_STATE_JAMMED);
+    finish_op_();
   });
 }
 
