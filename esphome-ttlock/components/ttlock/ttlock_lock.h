@@ -150,6 +150,7 @@ class TTLockLock : public lock::Lock,
   // ── Operation state ────────────────────────────────────────────────────
   OpState   op_state_   {OpState::IDLE};
   PendingOp pending_op_ {PendingOp::NONE};
+  bool      yielded_    {false};  // true while parked after being preempted mid-connect
   bool      passage_mode_ {false};
   bool     last_status_unlocked_ {false};
   uint32_t ps_from_lock_         {0};
@@ -180,11 +181,14 @@ class TTLockLock : public lock::Lock,
 
   // ── Cross-instance BLE radio arbitration ────────────────────────────────
   // Only one instance may hold the BLE client enabled at a time; others queue
-  // and get a fresh op watchdog once it's actually their turn.
+  // (background QUERYs behind user-initiated ops) and get a fresh op watchdog
+  // once it's actually their turn.
   static TTLockLock              *active_lock_;
   static std::vector<TTLockLock *> queue_;
+  static void enqueue_(TTLockLock *lock);
   void begin_op_();
   void finish_op_();
+  void yield_slot_();
 
   // ── Lock/unlock sequence ───────────────────────────────────────────────
   void arm_op_watchdog_();

@@ -198,14 +198,13 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
 
     // ── Connection open (possibly failed) ────────────────────────────────────
     // BLEClientBase already called set_idle_() before this node handler runs,
-    // so state is IDLE here on failure. Trigger reconnect directly — no defer needed.
+    // so it's back to IDLE here on failure. With auto_connect on (the ble_client
+    // default), BLEClientBase::parse_device() will pick the device back up itself
+    // on its next advertisement as long as we stay enabled — nothing to do here.
     case ESP_GATTC_OPEN_EVT:
-      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE &&
-          this->parent()->state() == espbt::ClientState::IDLE) {
-        ESP_LOGD(TAG, "OPEN_EVT error (status=%d), reconnecting for pending op=%d",
+      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE && !yielded_)
+        ESP_LOGD(TAG, "OPEN_EVT error (status=%d), waiting for next advertisement (pending op=%d)",
                  param->open.status, (int) pending_op_);
-        this->parent()->set_state(espbt::ClientState::DISCOVERED);
-      }
       break;
 
     // ── Service discovery complete: look up characteristic handles ───────────
@@ -251,9 +250,8 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
 
     // ── Disconnected: protocol cleanup only ──────────────────────────────────
     // Do NOT publish UNKNOWN – keep the last known state to avoid HA flicker.
-    // Reconnect decisions are made in CLOSE_EVT (state guaranteed IDLE there).
-    // For connection failures (reason=0x100) CLOSE_EVT may not follow; those
-    // are handled by OPEN_EVT above.
+    // Reconnecting (if pending_op_ is still set) just means staying enabled;
+    // BLEClientBase::parse_device() re-discovers the device on its own.
     case ESP_GATTC_DISCONNECT_EVT:
       write_handle_   = 0;
       notify_handle_  = 0;
@@ -261,13 +259,15 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
       rx_buf_.clear();
       // 0x100 = ESP_GATT_CONN_CONN_CANCEL: connection-establishment timeout,
       // never follows a completed op. BLEClientBase may auto-connect before
-      // parse_device runs (leaving pending_op_==NONE). Treat as QUERY so that
-      // the reconnect paths below activate instead of calling set_enabled(false).
+      // parse_device runs (leaving pending_op_==NONE). Treat as QUERY so we
+      // stay enabled instead of calling finish_op_() on a slot we never held.
       // Skip if disabled: that auto-connect race can't happen then, and it'd undo the watchdog's abandonment.
       if (param->disconnect.reason == 0x0100 && pending_op_ == PendingOp::NONE &&
           this->parent()->enabled)
         pending_op_ = PendingOp::QUERY;
-      if (pending_op_ != PendingOp::NONE) {
+      // Skip while yielded: this is a straggler from the connection attempt we
+      // just aborted in yield_slot_() — re-enabling here would undo the preemption.
+      if (pending_op_ != PendingOp::NONE && !yielded_) {
         // Don't reset the watchdog on connection-establishment failures (reason=0x100):
         // control()/set_passage_mode() already armed it, and resetting it every 20 s
         // (the BLE connection timeout) would prevent it from ever firing.
@@ -275,30 +275,13 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
         if (param->disconnect.reason != 0x0100)
           arm_op_watchdog_();
         this->parent()->set_enabled(true);
-        // For connection failures (reason=0x100) CLOSE_EVT may not fire.
-        // The OPEN_EVT handler triggers reconnect synchronously, but a UART-flush
-        // delay between BLEClientBase log lines can allow the tracker's loop() to
-        // start the scanner before OPEN_EVT is fully processed. run_later fires at
-        // the end of this loop iteration when OPEN_EVT has settled and state is IDLE.
-        // If OPEN_EVT already triggered reconnect (state=CONNECTING), this is a no-op.
-        this->parent()->run_later([this]() {
-          if (pending_op_ != PendingOp::NONE &&
-              this->parent()->state() == espbt::ClientState::IDLE)
-            this->parent()->set_state(espbt::ClientState::DISCOVERED);
-        });
       }
       break;
 
-    // ── BLE stack fully cleaned up: make reconnect decision ──────────────────
-    // BLEClientBase called set_idle_() before our handler runs, so state is
-    // guaranteed IDLE here. No run_later needed.
-    // Not fired for connection failures (reason=0x100) — OPEN_EVT covers that.
+    // ── BLE stack fully cleaned up: release the radio if we're done ──────────
     case ESP_GATTC_CLOSE_EVT:
-      if (pending_op_ != PendingOp::NONE) {
-        this->parent()->set_state(espbt::ClientState::DISCOVERED);
-      } else {
+      if (pending_op_ == PendingOp::NONE)
         finish_op_();
-      }
       break;
 
     default:
@@ -626,8 +609,9 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 
 // ── Operation watchdog ────────────────────────────────────────────────────────
 // Arms a 90-second one-shot timeout.  If pending operations are still set when
-// it fires, either the BLEClient is IDLE (reconnect and re-arm) or it is stuck
-// in CONNECTING/DISCONNECTING (clear ops; publish JAMMED only for user-initiated ops).
+// it fires, either the BLEClient is IDLE (stay enabled and re-arm — it'll pick
+// the device back up off its own next advertisement) or it is stuck in
+// CONNECTING/DISCONNECTING (clear ops; publish JAMMED only for user-initiated ops).
 
 void TTLockLock::arm_op_watchdog_() {
   cancel_timeout("op_wdog");
@@ -637,9 +621,8 @@ void TTLockLock::arm_op_watchdog_() {
     auto st = this->parent()->state();
     ESP_LOGW(TAG, "Op watchdog fired (client state=%d)", (int) st);
     if (st == espbt::ClientState::IDLE) {
-      ESP_LOGW(TAG, "Watchdog: client IDLE with pending ops – reconnecting");
+      ESP_LOGW(TAG, "Watchdog: client IDLE with pending ops – waiting for advertisement");
       this->parent()->set_enabled(true);
-      this->parent()->set_state(espbt::ClientState::DISCOVERED);
       arm_op_watchdog_();
     } else {
       bool had_user_op = (pending_op_ != PendingOp::QUERY);
@@ -659,21 +642,61 @@ void TTLockLock::arm_op_watchdog_() {
 // without this a second lock commanded at the same moment still calls
 // set_enabled(true)/arm_op_watchdog_() immediately, so its 90s budget ticks
 // down while it silently waits for a tracker turn it may never get in time.
+//
+// Background QUERYs (passive status/passage polls) are lower priority than
+// user-initiated ops (UNLOCK/LOCK/PASSAGE_*): queue_ keeps all pending urgent
+// ops ahead of pending QUERYs, and an urgent op arriving while some other
+// lock's QUERY is still just trying to connect (hasn't reached the lock yet,
+// so nothing is lost by pausing it) preempts it outright instead of waiting
+// out its connect attempt — or worst case its 90s watchdog — first.
 
 void TTLockLock::begin_op_() {
   if (active_lock_ != nullptr && active_lock_ != this) {
-    if (std::find(queue_.begin(), queue_.end(), this) == queue_.end())
-      queue_.push_back(this);
-    return;
+    bool urgent = (pending_op_ != PendingOp::QUERY);
+    if (urgent && active_lock_->pending_op_ == PendingOp::QUERY && active_lock_->op_state_ == OpState::IDLE) {
+      active_lock_->yield_slot_();
+    } else {
+      enqueue_(this);
+      return;
+    }
   }
   active_lock_ = this;
+  yielded_ = false;
   arm_op_watchdog_();
+  // Enabling is all that's needed: BLEClientBase::parse_device() (auto_connect,
+  // the ble_client default) picks the device up off its own next advertisement
+  // and the tracker promotes it to CONNECTING from there.
   this->parent()->set_enabled(true);
-  auto ble_st = this->parent()->state();
-  if (ble_st == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
+  if (this->parent()->state() == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
     start_pending_();
-  else if (ble_st == espbt::ClientState::IDLE)
-    this->parent()->set_state(espbt::ClientState::DISCOVERED);
+}
+
+// Give up the radio for a higher-priority op elsewhere without abandoning our
+// own pending_op_ — it stays queued (at QUERY priority) and resumes on its
+// own turn. yielded_ suppresses the DISCONNECT_EVT auto-continue below so the
+// straggler events from this abort don't re-enable us out of turn.
+void TTLockLock::yield_slot_() {
+  cancel_timeout("op_wdog");
+  yielded_ = true;
+  this->parent()->set_enabled(false);
+  active_lock_ = nullptr;
+  enqueue_(this);
+}
+
+// Inserts (or re-sorts, if already queued and its priority changed) lock into
+// queue_: urgent ops before any queued QUERYs, FIFO within each group.
+void TTLockLock::enqueue_(TTLockLock *lock) {
+  auto it = std::find(queue_.begin(), queue_.end(), lock);
+  if (it != queue_.end())
+    queue_.erase(it);
+  if (lock->pending_op_ == PendingOp::QUERY) {
+    queue_.push_back(lock);
+    return;
+  }
+  auto pos = queue_.begin();
+  while (pos != queue_.end() && (*pos)->pending_op_ != PendingOp::QUERY)
+    ++pos;
+  queue_.insert(pos, lock);
 }
 
 // Call whenever this instance is done needing the radio (pending_op_ must
@@ -930,9 +953,6 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
 
     // Params changed → trigger a status/passage query connection.
     // PendingOp::QUERY makes the watchdog active for this connection (not just user ops).
-    // Use set_state(DISCOVERED) so the tracker stops the scanner before connecting;
-    // calling connect() directly while the scanner is RUNNING leaves scanner_state_
-    // stuck at RUNNING after disconnect, preventing scan restart.
     if (pending_op_ == PendingOp::NONE)
       pending_op_ = PendingOp::QUERY;
     begin_op_();
