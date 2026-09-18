@@ -189,6 +189,8 @@ class TTLockLock : public lock::Lock,
   void begin_op_();
   void finish_op_();
   void yield_slot_();
+  void end_op_();                           // reset state + release radio
+  void end_op_(lock::LockState publish);    // publish final state, then end_op_()
 
   // ── Lock/unlock sequence ───────────────────────────────────────────────
   void arm_op_watchdog_();

@@ -371,10 +371,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
       } else {
         ESP_LOGE(TAG, "CHECK_ADMIN failed (cmd=0x%02X status=0x%02X len=%d)",
                  cmd, status, data.size());
-        op_state_   = OpState::IDLE;
-        pending_op_ = PendingOp::NONE;
-        this->publish_state(lock::LOCK_STATE_JAMMED);
-        finish_op_();
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
@@ -402,10 +399,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         }
       } else {
         ESP_LOGE(TAG, "CHECK_RANDOM failed (cmd=0x%02X status=0x%02X)", cmd, status);
-        op_state_   = OpState::IDLE;
-        pending_op_ = PendingOp::NONE;
-        this->publish_state(lock::LOCK_STATE_JAMMED);
-        finish_op_();
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
@@ -423,9 +417,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           op_state_ = OpState::LOCK_CMD;
           do_lock_();
         } else {
-          op_state_   = OpState::IDLE;
-          pending_op_ = PendingOp::NONE;
-          finish_op_();
+          end_op_();
         }
       } else {
         ESP_LOGE(TAG, "CHECK_USER_TIME failed (cmd=0x%02X status=0x%02X len=%d)",
@@ -438,9 +430,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           op_state_ = OpState::LOCK_CMD;
           do_lock_();
         } else {
-          op_state_   = OpState::IDLE;
-          pending_op_ = PendingOp::NONE;
-          finish_op_();
+          end_op_();
         }
       }
       break;
@@ -461,15 +451,11 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           pending_op_ = PendingOp::UNLOCK;
           do_check_user_time_();
         } else {
-          op_state_   = OpState::IDLE;
-          pending_op_ = PendingOp::NONE;
-          finish_op_();  // done – stop auto-reconnect
+          end_op_();  // done – stop auto-reconnect
         }
       } else {
         ESP_LOGW(TAG, "Unexpected response in QUERY_PASSAGE_CMD (cmd=0x%02X)", cmd);
-        op_state_   = OpState::IDLE;
-        pending_op_ = PendingOp::NONE;
-        finish_op_();
+        end_op_();
       }
       break;
 
@@ -495,10 +481,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           do_check_user_time_();
         } else {
           ESP_LOGE(TAG, "Passage mode disable failed (status=0x%02X)", status);
-          op_state_   = OpState::IDLE;
-          pending_op_ = PendingOp::NONE;
-          this->publish_state(lock::LOCK_STATE_JAMMED);
-          finish_op_();
+          end_op_(lock::LOCK_STATE_JAMMED);
         }
       }
       break;
@@ -710,6 +693,18 @@ void TTLockLock::finish_op_() {
       break;
     }
   }
+}
+
+void TTLockLock::end_op_() {
+  op_state_    = OpState::IDLE;
+  pending_op_  = PendingOp::NONE;
+  retry_count_ = 0;
+  finish_op_();
+}
+
+void TTLockLock::end_op_(lock::LockState publish) {
+  this->publish_state(publish);
+  end_op_();
 }
 
 // ── Normal operation sequence ─────────────────────────────────────────────────
