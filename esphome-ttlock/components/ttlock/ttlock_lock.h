@@ -156,7 +156,9 @@ class TTLockLock : public lock::Lock,
   uint32_t ps_from_lock_         {0};
   uint8_t  retry_count_          {0};  // protocol-level retries (unlock/lock rejection)
   uint64_t request_start_ms_     {0};  // esp_timer ms at control()/set_passage_mode() entry
-  static constexpr uint8_t MAX_RETRIES = 3;
+  uint64_t last_reunlock_ms_     {0};  // esp_timer ms of last passage re-unlock (0 = never)
+  static constexpr uint8_t  MAX_RETRIES = 3;
+  static constexpr uint32_t PASSAGE_REUNLOCK_COOLDOWN_MS = 300000;  // 5 min
 
   // ── RX buffer (reassembly across MTU chunks) ───────────────────────────
   std::vector<uint8_t> rx_buf_;
@@ -196,6 +198,7 @@ class TTLockLock : public lock::Lock,
 
   // ── Lock/unlock sequence ───────────────────────────────────────────────
   void arm_op_watchdog_();
+  bool passage_reunlock_due_();   // true (and arms cooldown) if a re-unlock is allowed now
   void start_pending_();
   void start_action_();   // dispatch pending UNLOCK/LOCK to its command, else end_op_()
   void do_query_status_();

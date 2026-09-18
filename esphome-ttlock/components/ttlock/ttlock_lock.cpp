@@ -439,8 +439,9 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         if (passage_switch_)
           passage_switch_->publish_state(passage_mode_);
         ESP_LOGI(TAG, "Passage mode: %s", passage_mode_ ? "ACTIVE" : "INACTIVE");
-        // Re-unlock if passage mode is active but the lock reported LOCKED.
-        if (passage_mode_ && !last_status_unlocked_) {
+        // Re-unlock if passage mode is active but the lock reported LOCKED,
+        // rate-limited so a boundary auto-lock can't thrash the lock all night.
+        if (passage_mode_ && !last_status_unlocked_ && passage_reunlock_due_()) {
           ESP_LOGI(TAG, "Passage mode active but locked – re-unlocking");
           pending_op_ = PendingOp::UNLOCK;
           do_check_user_time_();
@@ -518,7 +519,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           this->publish_state(lock::LOCK_STATE_LOCKED);
           if (passage_switch_)
             passage_switch_->publish_state(passage_mode_);
-          if (passage_mode_) {
+          if (passage_mode_ && passage_reunlock_due_()) {
             ESP_LOGI(TAG, "Passage mode active, re-unlocking after unsolicited lock");
             pending_op_ = PendingOp::UNLOCK;
             do_check_admin_();
@@ -679,6 +680,14 @@ void TTLockLock::handle_action_result_(uint8_t status, const std::vector<uint8_t
 }
 
 // ── Normal operation sequence ─────────────────────────────────────────────────
+
+bool TTLockLock::passage_reunlock_due_() {
+  uint64_t now = (uint64_t) esp_timer_get_time() / 1000;
+  if (last_reunlock_ms_ != 0 && now - last_reunlock_ms_ < PASSAGE_REUNLOCK_COOLDOWN_MS)
+    return false;
+  last_reunlock_ms_ = now;
+  return true;
+}
 
 void TTLockLock::start_pending_() {
   if (pending_op_ != PendingOp::NONE && pending_op_ != PendingOp::QUERY) {
