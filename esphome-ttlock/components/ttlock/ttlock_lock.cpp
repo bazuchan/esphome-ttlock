@@ -890,7 +890,7 @@ void TTLockLock::setup() {
 
 bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
   // Only handle our lock
-  if (device.address_str() != this->parent()->address_str())
+  if (device.address_uint64() != this->parent()->get_address())
     return false;
 
   for (const auto &mfr : device.get_manufacturer_datas()) {
@@ -922,7 +922,8 @@ bool TTLockLock::parse_device(const espbt::ESPBTDevice &device) {
     if ((state == adv_state) && (pending_op_ == PendingOp::NONE))
       return false;
 
-    ESP_LOGI(TAG, "[%s] ADV params=0x%02X -> %s, current state -> %s", device.address_str().c_str(), params,
+    char addr_buf[MAC_ADDRESS_PRETTY_BUFFER_SIZE];
+    ESP_LOGI(TAG, "[%s] ADV params=0x%02X -> %s, current state -> %s", device.address_str_to(addr_buf), params,
              LOG_STR_ARG(lock::lock_state_to_string(adv_state)), LOG_STR_ARG(lock::lock_state_to_string(state)));
 
     // Don't overwrite state mid-operation (GATTC sequence is authoritative)
