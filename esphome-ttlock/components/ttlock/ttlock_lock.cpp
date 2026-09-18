@@ -498,6 +498,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           op_state_   = OpState::IDLE;
           pending_op_ = PendingOp::NONE;
           this->publish_state(lock::LOCK_STATE_JAMMED);
+          finish_op_();
         }
       }
       break;
