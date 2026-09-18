@@ -197,6 +197,7 @@ class TTLockLock : public lock::Lock,
   // ── Lock/unlock sequence ───────────────────────────────────────────────
   void arm_op_watchdog_();
   void start_pending_();
+  void start_action_();   // dispatch pending UNLOCK/LOCK to its command, else end_op_()
   void do_query_status_();
   void do_check_admin_();
   void do_check_random_();

@@ -405,34 +405,16 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
 
     case OpState::CHECK_USER_TIME_CMD:
       if (cmd == CMD_CHECK_USER_TIME && status == 0x01 && data.size() >= 6) {
-        // Fresh ps_from_lock for the UNLOCK/LOCK sum — different from the one
-        // returned by CHECK_ADMIN on some lock models.
+        // Fresh ps_from_lock for the UNLOCK/LOCK sum — differs from CHECK_ADMIN's on some models.
         ps_from_lock_ = ((uint32_t) data[2] << 24) | ((uint32_t) data[3] << 16) |
                         ((uint32_t) data[4] <<  8) |  (uint32_t) data[5];
         ESP_LOGD(TAG, "CHECK_USER_TIME: ps_from_lock=0x%08X", (unsigned) ps_from_lock_);
-        if (pending_op_ == PendingOp::UNLOCK) {
-          op_state_ = OpState::UNLOCK_CMD;
-          do_unlock_();
-        } else if (pending_op_ == PendingOp::LOCK) {
-          op_state_ = OpState::LOCK_CMD;
-          do_lock_();
-        } else {
-          end_op_();
-        }
       } else {
+        // Fall back to the CHECK_ADMIN token already in ps_from_lock_.
         ESP_LOGE(TAG, "CHECK_USER_TIME failed (cmd=0x%02X status=0x%02X len=%d)",
                  cmd, status, data.size());
-        // Fall back: proceed with existing ps_from_lock from CHECK_ADMIN
-        if (pending_op_ == PendingOp::UNLOCK) {
-          op_state_ = OpState::UNLOCK_CMD;
-          do_unlock_();
-        } else if (pending_op_ == PendingOp::LOCK) {
-          op_state_ = OpState::LOCK_CMD;
-          do_lock_();
-        } else {
-          end_op_();
-        }
       }
+      start_action_();
       break;
 
     case OpState::QUERY_PASSAGE_CMD:
@@ -677,6 +659,18 @@ void TTLockLock::start_pending_() {
     do_check_admin_();
   } else {
     do_query_status_();
+  }
+}
+
+void TTLockLock::start_action_() {
+  if (pending_op_ == PendingOp::UNLOCK) {
+    op_state_ = OpState::UNLOCK_CMD;
+    do_unlock_();
+  } else if (pending_op_ == PendingOp::LOCK) {
+    op_state_ = OpState::LOCK_CMD;
+    do_lock_();
+  } else {
+    end_op_();
   }
 }
 
