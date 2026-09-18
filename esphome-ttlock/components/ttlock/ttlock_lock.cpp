@@ -213,9 +213,11 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     // default), BLEClientBase::parse_device() will pick the device back up itself
     // on its next advertisement as long as we stay enabled — nothing to do here.
     case ESP_GATTC_OPEN_EVT:
-      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE && !yielded_)
-        ESP_LOGD(TAG, "OPEN_EVT error (status=%d), waiting for next advertisement (pending op=%d)",
+      if (param->open.status != ESP_GATT_OK && pending_op_ != PendingOp::NONE && !yielded_) {
+        ESP_LOGD(TAG, "OPEN_EVT error (status=%d), retrying (pending op=%d)",
                  param->open.status, (int) pending_op_);
+        drive_connect_();  // fast_connect: reconnect now; else wait for next advertisement
+      }
       break;
 
     // ── Service discovery complete: look up characteristic handles ───────────
@@ -293,6 +295,8 @@ void TTLockLock::gattc_event_handler(esp_gattc_cb_event_t     event,
     case ESP_GATTC_CLOSE_EVT:
       if (pending_op_ == PendingOp::NONE)
         finish_op_();
+      else if (!yielded_)
+        drive_connect_();  // fast_connect: reconnect now; else wait for next advertisement
       break;
 
     default:
@@ -584,12 +588,21 @@ void TTLockLock::begin_op_() {
   active_lock_ = this;
   yielded_ = false;
   arm_op_watchdog_();
-  // Enabling is all that's needed: BLEClientBase::parse_device() (auto_connect,
-  // the ble_client default) picks the device up off its own next advertisement
-  // and the tracker promotes it to CONNECTING from there.
+  // Enabling lets BLEClientBase::parse_device() pick the device up off its next
+  // advertisement; with fast_connect_ we also force the connect immediately.
   this->parent()->set_enabled(true);
   if (this->parent()->state() == espbt::ClientState::ESTABLISHED && op_state_ == OpState::IDLE)
     start_pending_();
+  else
+    drive_connect_();
+}
+
+// With fast_connect_, force the client into DISCOVERED so the tracker promotes it
+// to a directed connect now, instead of waiting for the scanner to catch the next
+// advertisement. No-op unless enabled and currently IDLE.
+void TTLockLock::drive_connect_() {
+  if (fast_connect_ && this->parent()->state() == espbt::ClientState::IDLE)
+    this->parent()->set_state(espbt::ClientState::DISCOVERED);
 }
 
 // Give up the radio for a higher-priority op elsewhere without abandoning our

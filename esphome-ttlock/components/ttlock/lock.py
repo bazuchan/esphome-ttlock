@@ -35,6 +35,7 @@ CONF_GROUP_ID    = "group_id"
 CONF_ORG_ID      = "org_id"
 CONF_BATTERY     = "battery_level"
 CONF_PASSAGE     = "passage_mode"
+CONF_FAST_CONNECT = "fast_connect"
 
 
 def _validate_aes_key(value):
@@ -68,6 +69,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_SCENE,      default=0x02): cv.hex_uint8_t,
             cv.Optional(CONF_GROUP_ID,   default=0x0000): cv.uint16_t,
             cv.Optional(CONF_ORG_ID,     default=0x0000): cv.uint16_t,
+
+            # ── Retry behavior ────────────────────────────────────────────────
+            cv.Optional(CONF_FAST_CONNECT, default=True): cv.boolean,
 
             # ── Optional sensors / switches ───────────────────────────────────
             cv.Optional(CONF_BATTERY): sensor.sensor_schema(
@@ -108,6 +112,7 @@ async def to_code(config):
     cg.add(var.set_scene(config[CONF_SCENE]))
     cg.add(var.set_group_id(config[CONF_GROUP_ID]))
     cg.add(var.set_org_id(config[CONF_ORG_ID]))
+    cg.add(var.set_fast_connect(config[CONF_FAST_CONNECT]))
 
     if CONF_BATTERY in config:
         bat = await sensor.new_sensor(config[CONF_BATTERY])

@@ -104,6 +104,7 @@ class TTLockLock : public lock::Lock,
   void set_org_id(uint16_t v)     { lv_.org_id     = v; }
   void set_battery_sensor(sensor::Sensor *s) { battery_sensor_ = s; }
   void set_passage_switch(TTLockPassageSwitch *s) { passage_switch_ = s; }
+  void set_fast_connect(bool v)   { fast_connect_ = v; }
 
   // Called by TTLockPassageSwitch
   void set_passage_mode(bool enable);
@@ -146,6 +147,7 @@ class TTLockLock : public lock::Lock,
   uint32_t    unlock_key_ {0};
   uint8_t     aes_key_[16]{};
   LockVersion lv_;
+  bool        fast_connect_{true};  // actively re-drive connects instead of waiting for an advertisement
 
   // ── Operation state ────────────────────────────────────────────────────
   OpState   op_state_   {OpState::IDLE};
@@ -191,6 +193,7 @@ class TTLockLock : public lock::Lock,
   void begin_op_();
   void finish_op_();
   void yield_slot_();
+  void drive_connect_();   // if fast_connect_ and IDLE, force a connect instead of waiting for an advertisement
   void end_op_();                           // reset state + release radio
   void end_op_(lock::LockState publish);    // publish final state, then end_op_()
   void handle_action_result_(uint8_t status, const std::vector<uint8_t> &data, const char *verb,

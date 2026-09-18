@@ -68,6 +68,13 @@ lock:
     passage_mode:
       name: "Front Door Passage Mode"
 
+    # fast_connect (default: true): on a failed/dropped connection, immediately
+    # re-drive a directed connect instead of waiting for the lock's next
+    # advertisement. Keeps retries at the ~20s connection-timeout cadence; with
+    # false, each retry waits for an advertisement (tens of seconds) but yields
+    # more BLE/WiFi coexistence headroom. Set false only if BLE is starving WiFi.
+    # fast_connect: true
+
     # Protocol version defaults suit most V3 door locks.
     # Override only if needed:
     # protocol_type: 0x05
