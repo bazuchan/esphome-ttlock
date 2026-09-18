@@ -191,6 +191,8 @@ class TTLockLock : public lock::Lock,
   void yield_slot_();
   void end_op_();                           // reset state + release radio
   void end_op_(lock::LockState publish);    // publish final state, then end_op_()
+  void handle_action_result_(uint8_t status, const std::vector<uint8_t> &data, const char *verb,
+                             lock::LockState ok_state, lock::LockState reject_state);
 
   // ── Lock/unlock sequence ───────────────────────────────────────────────
   void arm_op_watchdog_();

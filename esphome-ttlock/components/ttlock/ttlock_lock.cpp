@@ -487,80 +487,13 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
       break;
 
     case OpState::UNLOCK_CMD:
-      if (cmd == CMD_UNLOCK) {
-        op_state_ = OpState::IDLE;
-        uint32_t elapsed_ms = (uint32_t)((uint64_t) esp_timer_get_time() / 1000 - request_start_ms_);
-        if (status == 0x01) {
-          pending_op_  = PendingOp::NONE;
-          retry_count_ = 0;
-          // Battery is only valid in the full success response (≥3 bytes, status=0x01)
-          if (data.size() >= 3) {
-            uint8_t battery = data[2];
-            ESP_LOGI(TAG, "Unlocked  battery=%d%%  elapsed=%ums", battery, (unsigned) elapsed_ms);
-            if (battery_sensor_)
-              battery_sensor_->publish_state((float) battery);
-          } else {
-            ESP_LOGI(TAG, "Unlocked  elapsed=%ums", (unsigned) elapsed_ms);
-          }
-          this->publish_state(lock::LOCK_STATE_UNLOCKED);
-          if (passage_switch_)
-            passage_switch_->publish_state(passage_mode_);
-          finish_op_();  // done – stop auto-reconnect
-        } else {
-          if (++retry_count_ < MAX_RETRIES) {
-            ESP_LOGW(TAG, "Unlock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
-                     status, retry_count_, MAX_RETRIES, (unsigned) elapsed_ms);
-            this->publish_state(lock::LOCK_STATE_LOCKED);
-            // pending_op_ stays UNLOCK; DISCONNECT_EVT will reconnect
-          } else {
-            ESP_LOGE(TAG, "Unlock failed after %d retries – giving up  elapsed=%ums",
-                     MAX_RETRIES, (unsigned) elapsed_ms);
-            pending_op_  = PendingOp::NONE;
-            retry_count_ = 0;
-            this->publish_state(lock::LOCK_STATE_JAMMED);
-            finish_op_();
-          }
-        }
-      }
+      if (cmd == CMD_UNLOCK)
+        handle_action_result_(status, data, "Unlock", lock::LOCK_STATE_UNLOCKED, lock::LOCK_STATE_LOCKED);
       break;
 
     case OpState::LOCK_CMD:
-      if (cmd == CMD_LOCK) {
-        op_state_ = OpState::IDLE;
-        uint32_t elapsed_ms = (uint32_t)((uint64_t) esp_timer_get_time() / 1000 - request_start_ms_);
-        if (status == 0x01) {
-          pending_op_   = PendingOp::NONE;
-          retry_count_  = 0;
-          passage_mode_ = false;  // locking always exits passage mode
-          // Battery is only valid in the full success response (≥3 bytes, status=0x01)
-          if (data.size() >= 3) {
-            uint8_t battery = data[2];
-            ESP_LOGI(TAG, "Locked  battery=%d%%  elapsed=%ums", battery, (unsigned) elapsed_ms);
-            if (battery_sensor_)
-              battery_sensor_->publish_state((float) battery);
-          } else {
-            ESP_LOGI(TAG, "Locked  elapsed=%ums", (unsigned) elapsed_ms);
-          }
-          this->publish_state(lock::LOCK_STATE_LOCKED);
-          if (passage_switch_)
-            passage_switch_->publish_state(false);
-          finish_op_();  // done – stop auto-reconnect
-        } else {
-          if (++retry_count_ < MAX_RETRIES) {
-            ESP_LOGW(TAG, "Lock rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
-                     status, retry_count_, MAX_RETRIES, (unsigned) elapsed_ms);
-            this->publish_state(lock::LOCK_STATE_UNLOCKED);
-            // pending_op_ stays LOCK; DISCONNECT_EVT will reconnect
-          } else {
-            ESP_LOGE(TAG, "Lock failed after %d retries – giving up  elapsed=%ums",
-                     MAX_RETRIES, (unsigned) elapsed_ms);
-            pending_op_  = PendingOp::NONE;
-            retry_count_ = 0;
-            this->publish_state(lock::LOCK_STATE_JAMMED);
-            finish_op_();
-          }
-        }
-      }
+      if (cmd == CMD_LOCK)
+        handle_action_result_(status, data, "Lock", lock::LOCK_STATE_LOCKED, lock::LOCK_STATE_UNLOCKED);
       break;
 
     case OpState::IDLE:
@@ -705,6 +638,36 @@ void TTLockLock::end_op_() {
 void TTLockLock::end_op_(lock::LockState publish) {
   this->publish_state(publish);
   end_op_();
+}
+
+void TTLockLock::handle_action_result_(uint8_t status, const std::vector<uint8_t> &data, const char *verb,
+                                       lock::LockState ok_state, lock::LockState reject_state) {
+  op_state_ = OpState::IDLE;
+  uint32_t elapsed_ms = (uint32_t)((uint64_t) esp_timer_get_time() / 1000 - request_start_ms_);
+  if (status == 0x01) {
+    if (ok_state == lock::LOCK_STATE_LOCKED)
+      passage_mode_ = false;  // locking always exits passage mode
+    if (data.size() >= 3) {
+      uint8_t battery = data[2];
+      ESP_LOGI(TAG, "%sed  battery=%d%%  elapsed=%ums", verb, battery, (unsigned) elapsed_ms);
+      if (battery_sensor_)
+        battery_sensor_->publish_state((float) battery);
+    } else {
+      ESP_LOGI(TAG, "%sed  elapsed=%ums", verb, (unsigned) elapsed_ms);
+    }
+    this->publish_state(ok_state);
+    if (passage_switch_)
+      passage_switch_->publish_state(passage_mode_);
+    end_op_();
+  } else if (++retry_count_ < MAX_RETRIES) {
+    ESP_LOGW(TAG, "%s rejected (status=0x%02X) – retry %d/%d  elapsed=%ums",
+             verb, status, retry_count_, MAX_RETRIES, (unsigned) elapsed_ms);
+    this->publish_state(reject_state);  // pending_op_ stays; DISCONNECT_EVT reconnects
+  } else {
+    ESP_LOGE(TAG, "%s failed after %d retries – giving up  elapsed=%ums",
+             verb, MAX_RETRIES, (unsigned) elapsed_ms);
+    end_op_(lock::LOCK_STATE_JAMMED);
+  }
 }
 
 // ── Normal operation sequence ─────────────────────────────────────────────────
