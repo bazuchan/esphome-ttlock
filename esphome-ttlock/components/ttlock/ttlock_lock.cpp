@@ -686,6 +686,7 @@ bool TTLockLock::passage_reunlock_due_() {
   if (last_reunlock_ms_ != 0 && now - last_reunlock_ms_ < PASSAGE_REUNLOCK_COOLDOWN_MS)
     return false;
   last_reunlock_ms_ = now;
+  request_start_ms_ = now;  // so the re-unlock's elapsed log measures this op
   return true;
 }
 
