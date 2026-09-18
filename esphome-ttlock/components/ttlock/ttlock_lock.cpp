@@ -40,6 +40,17 @@ static const uint8_t DSCRC[256] = {
     116,  42, 200, 150,  21,  75, 169, 247, 182, 232,  10,  84, 215, 137, 107,  53,
 };
 
+static inline void put_u32_be(uint8_t *buf, uint32_t v) {
+  buf[0] = (v >> 24) & 0xFF;
+  buf[1] = (v >> 16) & 0xFF;
+  buf[2] = (v >>  8) & 0xFF;
+  buf[3] =  v        & 0xFF;
+}
+
+static inline uint32_t get_u32_be(const uint8_t *p) {
+  return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) | (uint32_t) p[3];
+}
+
 uint8_t TTLockLock::crc8_(const uint8_t *data, size_t len) {
   uint8_t crc = 0;
   for (size_t i = 0; i < len; i++)
@@ -363,8 +374,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
     case OpState::CHECK_ADMIN:
       if (cmd == CMD_CHECK_ADMIN && data.size() >= 6) {
         // psFromLock is at data[2..5] (after cmd type byte + status byte)
-        ps_from_lock_ = ((uint32_t) data[2] << 24) | ((uint32_t) data[3] << 16) |
-                        ((uint32_t) data[4] <<  8) |  (uint32_t) data[5];
+        ps_from_lock_ = get_u32_be(&data[2]);
         ESP_LOGD(TAG, "CHECK_ADMIN: got token from lock");
         op_state_ = OpState::CHECK_RANDOM;
         do_check_random_();
@@ -406,8 +416,7 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
     case OpState::CHECK_USER_TIME_CMD:
       if (cmd == CMD_CHECK_USER_TIME && status == 0x01 && data.size() >= 6) {
         // Fresh ps_from_lock for the UNLOCK/LOCK sum — differs from CHECK_ADMIN's on some models.
-        ps_from_lock_ = ((uint32_t) data[2] << 24) | ((uint32_t) data[3] << 16) |
-                        ((uint32_t) data[4] <<  8) |  (uint32_t) data[5];
+        ps_from_lock_ = get_u32_be(&data[2]);
         ESP_LOGD(TAG, "CHECK_USER_TIME: ps_from_lock=0x%08X", (unsigned) ps_from_lock_);
       } else {
         // Fall back to the CHECK_ADMIN token already in ps_from_lock_.
@@ -688,10 +697,7 @@ void TTLockLock::do_check_admin_() {
   // uid (0) at offset 7 → effectively adminPs + 7 zero bytes = 11 bytes total.
   // Matches JS SDK CheckAdminCommand.build() with lockFlagPos=0, uid=0.
   uint8_t data[11] = {};
-  data[0] = (admin_ps_ >> 24) & 0xFF;
-  data[1] = (admin_ps_ >> 16) & 0xFF;
-  data[2] = (admin_ps_ >>  8) & 0xFF;
-  data[3] =  admin_ps_        & 0xFF;
+  put_u32_be(data, admin_ps_);
   // bytes 4-10 remain zero
   op_state_ = OpState::CHECK_ADMIN;
   ESP_LOGD(TAG, "→ CHECK_ADMIN");
@@ -701,10 +707,7 @@ void TTLockLock::do_check_admin_() {
 void TTLockLock::do_check_random_() {
   uint32_t sum = ps_from_lock_ + unlock_key_;
   uint8_t data[4];
-  data[0] = (sum >> 24) & 0xFF;
-  data[1] = (sum >> 16) & 0xFF;
-  data[2] = (sum >>  8) & 0xFF;
-  data[3] =  sum        & 0xFF;
+  put_u32_be(data, sum);
   ESP_LOGD(TAG, "→ CHECK_RANDOM");
   send_cmd_(CMD_CHECK_RANDOM, data, sizeof(data));
 }
@@ -728,14 +731,8 @@ void TTLockLock::do_unlock_() {
   uint32_t sum = ps_from_lock_ + unlock_key_;
   uint32_t ts  = (uint32_t) time(nullptr);
   uint8_t data[8];
-  data[0] = (sum >> 24) & 0xFF;
-  data[1] = (sum >> 16) & 0xFF;
-  data[2] = (sum >>  8) & 0xFF;
-  data[3] =  sum        & 0xFF;
-  data[4] = (ts  >> 24) & 0xFF;
-  data[5] = (ts  >> 16) & 0xFF;
-  data[6] = (ts  >>  8) & 0xFF;
-  data[7] =  ts         & 0xFF;
+  put_u32_be(data, sum);
+  put_u32_be(data + 4, ts);
   ESP_LOGD(TAG, "→ UNLOCK");
   send_cmd_(CMD_UNLOCK, data, sizeof(data));
 }
@@ -744,14 +741,8 @@ void TTLockLock::do_lock_() {
   uint32_t sum = ps_from_lock_ + unlock_key_;
   uint32_t ts  = (uint32_t) time(nullptr);
   uint8_t data[8];
-  data[0] = (sum >> 24) & 0xFF;
-  data[1] = (sum >> 16) & 0xFF;
-  data[2] = (sum >>  8) & 0xFF;
-  data[3] =  sum        & 0xFF;
-  data[4] = (ts  >> 24) & 0xFF;
-  data[5] = (ts  >> 16) & 0xFF;
-  data[6] = (ts  >>  8) & 0xFF;
-  data[7] =  ts         & 0xFF;
+  put_u32_be(data, sum);
+  put_u32_be(data + 4, ts);
   ESP_LOGD(TAG, "→ LOCK");
   send_cmd_(CMD_LOCK, data, sizeof(data));
 }
