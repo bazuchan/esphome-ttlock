@@ -366,6 +366,9 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         }
         // Always follow with a passage mode query so passage_mode_ stays in sync.
         do_check_admin_();
+      } else {
+        ESP_LOGE(TAG, "Unexpected response in QUERY_STATUS (cmd=0x%02X)", cmd);
+        end_op_();
       }
       break;
 
@@ -460,6 +463,9 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
         }
         pending_op_ = PendingOp::UNLOCK;
         do_check_user_time_();
+      } else {
+        ESP_LOGE(TAG, "Unexpected response in PASSAGE_ON_CMD (cmd=0x%02X)", cmd);
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
@@ -474,17 +480,28 @@ void TTLockLock::handle_response_(uint8_t raw_cmd, const std::vector<uint8_t> &d
           ESP_LOGE(TAG, "Passage mode disable failed (status=0x%02X)", status);
           end_op_(lock::LOCK_STATE_JAMMED);
         }
+      } else {
+        ESP_LOGE(TAG, "Unexpected response in PASSAGE_OFF_CMD (cmd=0x%02X)", cmd);
+        end_op_(lock::LOCK_STATE_JAMMED);
       }
       break;
 
     case OpState::UNLOCK_CMD:
-      if (cmd == CMD_UNLOCK)
+      if (cmd == CMD_UNLOCK) {
         handle_action_result_(status, data, "Unlock", lock::LOCK_STATE_UNLOCKED, lock::LOCK_STATE_LOCKED);
+      } else {
+        ESP_LOGE(TAG, "Unexpected response in UNLOCK_CMD (cmd=0x%02X)", cmd);
+        end_op_(lock::LOCK_STATE_JAMMED);
+      }
       break;
 
     case OpState::LOCK_CMD:
-      if (cmd == CMD_LOCK)
+      if (cmd == CMD_LOCK) {
         handle_action_result_(status, data, "Lock", lock::LOCK_STATE_LOCKED, lock::LOCK_STATE_UNLOCKED);
+      } else {
+        ESP_LOGE(TAG, "Unexpected response in LOCK_CMD (cmd=0x%02X)", cmd);
+        end_op_(lock::LOCK_STATE_JAMMED);
+      }
       break;
 
     case OpState::IDLE:
