@@ -651,6 +651,7 @@ void TTLockLock::finish_op_() {
 }
 
 void TTLockLock::end_op_() {
+  cancel_timeout("op_wdog");  // op is done – don't let its 90s timer fire later and kill a fresh op
   op_state_    = OpState::IDLE;
   pending_op_  = PendingOp::NONE;
   retry_count_ = 0;
